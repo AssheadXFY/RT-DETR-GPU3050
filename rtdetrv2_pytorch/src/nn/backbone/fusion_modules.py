@@ -45,8 +45,10 @@ class Spatial(nn.Module):
 
 class _ConvBN(nn.Module):
     """Conv2d + BatchNorm2d + optional activation."""
-    def __init__(self, ch_in, ch_out, kernel_size=3, stride=1, padding=1, groups=1, act=True):
+    def __init__(self, ch_in, ch_out, kernel_size=3, stride=1, padding=None, groups=1, act=True):
         super().__init__()
+        if padding is None:
+            padding = (kernel_size - 1) // 2
         self.conv = nn.Conv2d(ch_in, ch_out, kernel_size, stride, padding, groups=groups, bias=False)
         self.bn = nn.BatchNorm2d(ch_out)
         self.act = nn.SiLU() if act else nn.Identity()
