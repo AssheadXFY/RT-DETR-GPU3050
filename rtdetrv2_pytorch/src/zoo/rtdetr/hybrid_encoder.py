@@ -16,6 +16,18 @@ from ...core import register
 __all__ = ['HybridEncoder']
 
 
+def _create_fusion_block(block_type, c1, c2, num_blocks, expansion, act):
+    """Create a fusion block by type. Falls back to CSPRepLayer."""
+    if block_type == 'fcm':
+        from ...nn.backbone.fusion_modules import FCMBlock
+        return FCMBlock(c1, c2, num_blocks=num_blocks)
+    elif block_type == 'freq':
+        from ...nn.backbone.fusion_modules import FreqSpatialBlock
+        return FreqSpatialBlock(c1, c2, num_blocks=num_blocks)
+    else:
+        return CSPRepLayer(c1, c2, num_blocks=num_blocks, expansion=expansion, act=act)
+
+
 
 class ConvNormLayer(nn.Module):
     def __init__(self, ch_in, ch_out, kernel_size, stride, padding=None, bias=False, act=None):
@@ -197,8 +209,9 @@ class HybridEncoder(nn.Module):
                  expansion=1.0,
                  depth_mult=1.0,
                  act='silu',
-                 eval_spatial_size=None, 
-                 version='v2'):
+                 eval_spatial_size=None,
+                 version='v2',
+                 fpn_block_type='csp'):
         super().__init__()
         self.in_channels = in_channels
         self.feat_strides = feat_strides
@@ -206,7 +219,7 @@ class HybridEncoder(nn.Module):
         self.use_encoder_idx = use_encoder_idx
         self.num_encoder_layers = num_encoder_layers
         self.pe_temperature = pe_temperature
-        self.eval_spatial_size = eval_spatial_size        
+        self.eval_spatial_size = eval_spatial_size
         self.out_channels = [hidden_dim for _ in range(len(in_channels))]
         self.out_strides = feat_strides
         
@@ -245,7 +258,8 @@ class HybridEncoder(nn.Module):
         for _ in range(len(in_channels) - 1, 0, -1):
             self.lateral_convs.append(ConvNormLayer(hidden_dim, hidden_dim, 1, 1, act=act))
             self.fpn_blocks.append(
-                CSPRepLayer(hidden_dim * 2, hidden_dim, round(3 * depth_mult), act=act, expansion=expansion)
+                _create_fusion_block(fpn_block_type, hidden_dim * 2, hidden_dim,
+                                     round(3 * depth_mult), expansion, act)
             )
 
         # bottom-up pan
@@ -256,7 +270,8 @@ class HybridEncoder(nn.Module):
                 ConvNormLayer(hidden_dim, hidden_dim, 3, 2, act=act)
             )
             self.pan_blocks.append(
-                CSPRepLayer(hidden_dim * 2, hidden_dim, round(3 * depth_mult), act=act, expansion=expansion)
+                _create_fusion_block(fpn_block_type, hidden_dim * 2, hidden_dim,
+                                     round(3 * depth_mult), expansion, act)
             )
 
         self._reset_parameters()

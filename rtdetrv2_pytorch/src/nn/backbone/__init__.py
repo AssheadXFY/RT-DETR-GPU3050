@@ -16,3 +16,6 @@ from .csp_resnet import CSPResNet
 from .csp_darknet import CSPDarkNet, CSPPAN
 
 from .hgnetv2 import HGNetv2
+
+from .fusion_modules import FCM, FCM_1, FCMBlock, FreqSpatialBlock
+from .shab import SHAB, SHSABlock
