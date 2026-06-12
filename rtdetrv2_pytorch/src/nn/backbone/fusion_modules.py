@@ -115,23 +115,23 @@ class FCM_1(nn.Module):
 class FCMBlock(nn.Module):
     """CSP-like block using FCM as the bottleneck.
 
-    Takes concatenated features (channel=dim*2) from FPN/PAN, processes
-    though FCM bottleneck blocks, fuses via split + fuse.
+    Takes concatenated features (channel=dim*2) from FPN/PAN, splits into
+    two paths (a and b), processes path a through FCM bottlenecks, fuses both.
+    Matches CSPRepLayer's interface and output shape.
     """
     def __init__(self, c1, c2, num_blocks=3):
         super().__init__()
         hidden = c2
-        self.conv_a = _ConvBN(c1, hidden, 3, act=True)
+        self.conv_a = _ConvBN(c1, hidden, 1, act=True)
         self.conv_b = _ConvBN(c1, hidden, 1, act=True)
-        self.m = nn.ModuleList([FCM_1(hidden, hidden) for _ in range(num_blocks)])
-        self.conv_out = _ConvBN(hidden, c2, 1, act=True)
+        self.m = nn.Sequential(*[FCM_1(hidden, hidden) for _ in range(num_blocks)])
+        self.conv_out = _ConvBN(hidden, c2, 1, act=True) if hidden != c2 else nn.Identity()
 
     def forward(self, x):
-        y = [self.conv_a(x)]
-        for m in self.m:
-            y.append(m(y[-1]))
-        y = torch.concat(y, dim=1)
-        return self.conv_out(y)
+        x_a = self.conv_a(x)
+        x_a = self.m(x_a)
+        x_b = self.conv_b(x)
+        return self.conv_out(x_a + x_b)
 
 
 # ==================== FreqSpatial Family (from FSDETR) ====================
