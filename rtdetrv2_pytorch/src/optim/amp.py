@@ -16,7 +16,8 @@ def _get_grad_scaler():
     return torch.amp.GradScaler  # PyTorch >= 2.0
 
 
-class _DeviceGradScaler:
+@register()
+class GradScaler:
     """GradScaler wrapper that auto-detects device type (CUDA/NPU).
     Supports both new torch.amp API (PT>=2.0) and old torch.npu.amp API.
     """
@@ -30,6 +31,3 @@ class _DeviceGradScaler:
             return Scaler(device_type=dt, *args, **kwargs)
         except TypeError:
             return Scaler(*args, **kwargs)
-
-
-GradScaler = register()(_DeviceGradScaler)

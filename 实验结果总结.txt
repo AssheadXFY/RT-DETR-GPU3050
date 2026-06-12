@@ -1,0 +1,147 @@
+================================================================================
+RT-DETRv2-S (R18) 环境搭建 + NPU适配 + 训练/推理 完整记录
+================================================================================
+
+一、本地环境 (Windows + RTX 3050 Ti)
+--------------------------------------------------------------------------------
+  环境:     conda rtdetr, Python 3.11.15
+  框架:     PyTorch 2.5.1+cu121, torchvision 0.20.1+cu121
+  GPU:      NVIDIA GeForce RTX 3050 Ti Laptop (4GB VRAM)
+  依赖:     tensorboard, scipy, pycocotools, faster-coco-eval, onnx, onnxruntime-gpu
+  配置:     480x480, batch_size=2, num_workers=0, amp=True
+
+  训练命令:
+    python tools/train.py \
+      -c configs/rtdetrv2/rtdetrv2_r18vd_120e_coco.yml \
+      --use-amp --seed=0 \
+      -u train_dataloader.total_batch_size=2 train_dataloader.num_workers=0 \
+         val_dataloader.total_batch_size=4
+
+  本地每 batch 耗时 ~0.25s，每 epoch 约 4 小时，120 epoch 约 20 天。
+
+
+二、NPU 适配 (6 个文件修改)
+--------------------------------------------------------------------------------
+
+  改动文件:
+    1) src/misc/dist_utils.py
+       - 新增 _get_accelerator() 自动检测 torch_npu / torch.cuda / cpu
+       - 新增 device_type(), device_module(), is_device_available()
+       - 所有 torch.cuda.* 替换为动态检测
+
+    2) src/solver/_solver.py
+       - device 选择从硬编码 'cuda' 改为 dist_utils.device_type()
+
+    3) src/core/_config.py
+       - from torch.cuda.amp.grad_scaler import GradScaler
+         → import torch.amp
+       - scaler 属性根据 device 动态创建 GradScaler
+       - 兼容新版 torch.amp.GradScaler 和旧版 torch.npu.amp.GradScaler
+
+    4) src/solver/det_engine.py
+       - 移除 from torch.cuda.amp.grad_scaler import GradScaler
+       - autocast 的 device_type 改为动态
+
+    5) src/optim/amp.py
+       - GradScaler 改为 @register() 装饰的 wrapper 类
+       - 自动检测 device_module() 的 amp.GradScaler
+
+    6) src/misc/logger.py
+       - SmoothedValue / all_gather / MetricLogger 中 'cuda' 改为动态
+
+  检测逻辑:
+    import torch_npu 成功 → NPU
+                    失败 → torch.cuda 可用 → CUDA
+                                          → CPU
+
+  配置文件改动:
+    configs/rtdetrv2/include/dataloader.yml
+      - 训练 Resize: [640,640] → [480,480]
+      - 多尺度: 10个尺度 → [480]
+      - 验证 Resize: [640,640] → [480,480]
+
+
+三、GitHub 仓库
+--------------------------------------------------------------------------------
+  仓库:     https://github.com/AssheadXFY/RT-DETR-GPU3050
+  分支:
+    main   → 原始版，CUDA only (仅含 480 配置修改)
+    NPU    → NPU 兼容版，CUDA/NPU 自适应
+
+
+四、NPU 服务器环境
+--------------------------------------------------------------------------------
+  NPU:      2 x Ascend 910ProB
+  框架:     torch_npu 2.1.0, Python 3.10
+  关键修复:
+    - 降级 numpy<2 (解决 torch_npu 与 NumPy 2.x 不兼容)
+    - 替换 opencv-python → opencv-python-headless (解决 libGL 缺失和 cv2.typing 污染)
+    - 传预训练权重 ResNet18_vd_pretrained_from_paddle.pth 到 /root/.cache/torch/hub/checkpoints/
+
+  训练命令 (单卡):
+    python tools/train.py \
+      -c configs/rtdetrv2/rtdetrv2_r18vd_120e_coco.yml \
+      --use-amp --seed=0 \
+      -u train_dataloader.total_batch_size=16 train_dataloader.num_workers=0 \
+         val_dataloader.total_batch_size=16 val_dataloader.num_workers=0
+
+  首次训练耗时:
+    - 模型加载: <1s
+    - 算子编译: ~35 min (首次, 后续缓存)
+    - 首个 batch: 2025s (含编译)
+    - 稳定训练: ~0.5-2s/batch
+
+
+五、验证结果
+--------------------------------------------------------------------------------
+
+  验证命令:
+    python tools/train.py \
+      -c configs/rtdetrv2/rtdetrv2_r18vd_120e_coco.yml \
+      -r weights/rtdetrv2_r18vd_120e_coco_rerun_48.1.pth \
+      --test-only \
+      -u val_dataloader.total_batch_size=16 val_dataloader.num_workers=0
+
+  需先将 val resize 改回 [640, 640] (预训练权重是 640 训练的)
+
+  IoU metric: bbox
+
+  | 指标                         | 值      |
+  |------------------------------|---------|
+  | AP@[0.50:0.95] (mAP)         | 0.481   |
+  | AP@0.50                      | 0.651   |
+  | AP@0.75                      | 0.521   |
+  | AP@[0.50:0.95] small         | 0.302   |
+  | AP@[0.50:0.95] medium        | 0.512   |
+  | AP@[0.50:0.95] large         | 0.642   |
+  | AR@1                         | 0.371   |
+  | AR@10                        | 0.631   |
+  | AR@100                       | 0.701   |
+  | AR@100 small                 | 0.527   |
+  | AR@100 medium                | 0.737   |
+  | AR@100 large                 | 0.857   |
+
+  性能指标:
+  | 指标          | 值         |
+  |---------------|-----------|
+  | 推理尺寸       | 640x640   |
+  | batch_size    | 16        |
+  | 编译时间       | ~15 min   |
+  | 稳定推理       | 0.82s/batch |
+  | 吞吐量         | ~19.5 FPS |
+  | 总验证时间     | 31 min    |
+  | 显存占用       | 1.3 GB    |
+
+
+六、结论
+--------------------------------------------------------------------------------
+  1. RT-DETRv2-S (R18) 在 Ascend 910ProB 上推理精度为 48.1% mAP，
+     与官方标称完全一致，NPU 适配零精度损失。
+
+  2. 单卡 Ascend 910ProB 推理吞吐约 19.5 FPS (bs=16, 640x640)。
+
+  3. NPU 训练代码已完全跑通，首次需算子编译 (~35min)，后续利用缓存。
+
+  4. 同一套代码自动兼容 CUDA / NPU / CPU，无需手动切换。
+
+================================================================================
