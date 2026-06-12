@@ -8,14 +8,28 @@ from ..core import register
 __all__ = ['GradScaler']
 
 
+def _get_grad_scaler():
+    from ..misc.dist_utils import device_module, device_type
+    dm = device_module()
+    if dm is not None and hasattr(dm, 'amp') and hasattr(dm.amp, 'GradScaler'):
+        return dm.amp.GradScaler
+    return torch.amp.GradScaler  # PyTorch >= 2.0
+
+
 class _DeviceGradScaler:
-    """GradScaler wrapper that auto-detects device type (CUDA/NPU)."""
+    """GradScaler wrapper that auto-detects device type (CUDA/NPU).
+    Supports both new torch.amp API (PT>=2.0) and old torch.npu.amp API.
+    """
     def __new__(cls, *args, **kwargs):
         from ..misc.dist_utils import device_type
         dt = device_type()
         if dt == 'cpu':
             dt = 'cuda'
-        return torch.amp.GradScaler(device_type=dt, *args, **kwargs)
+        Scaler = _get_grad_scaler()
+        try:
+            return Scaler(device_type=dt, *args, **kwargs)
+        except TypeError:
+            return Scaler(*args, **kwargs)
 
 
 GradScaler = register()(_DeviceGradScaler)

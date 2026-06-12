@@ -1,7 +1,8 @@
 """Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
+from __future__ import annotations
 
-import torch 
+import torch
 import torch.nn as nn 
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import Optimizer
@@ -173,9 +174,13 @@ class BaseConfig(object):
     @property
     def scaler(self) -> torch.amp.GradScaler:
         if self._scaler is None and self.use_amp:
-            from ..misc.dist_utils import device_type, is_device_available
+            from ..misc.dist_utils import device_module, device_type, is_device_available
             if is_device_available():
-                self._scaler = torch.amp.GradScaler(device_type=device_type())
+                dm = device_module()
+                if dm is not None and hasattr(dm, 'amp') and hasattr(dm.amp, 'GradScaler'):
+                    self._scaler = dm.amp.GradScaler()
+                else:
+                    self._scaler = torch.amp.GradScaler(device_type=device_type())
         return self._scaler
 
     @scaler.setter

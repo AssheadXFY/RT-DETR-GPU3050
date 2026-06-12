@@ -4,6 +4,7 @@ https://github.com/facebookresearch/detr/blob/main/engine.py
 
 Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
+from __future__ import annotations
 
 import sys
 import math
