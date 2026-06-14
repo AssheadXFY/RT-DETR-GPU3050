@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"path": ".."
+		},
+		{
+			"path": "../../FSDETR-main"
+		},
+		{
+			"path": "../../FCM-main"
+		}
+	]
+}

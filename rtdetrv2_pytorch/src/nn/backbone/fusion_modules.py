@@ -177,13 +177,16 @@ class FreqSpatial(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
+        dtype = x.dtype
+
         # spatial path
         sf = self.sed(x)
         sf = self.spatial_conv1(sf)
         sf = self.spatial_conv2(sf + x)
 
-        # frequency path
-        fft = torch.fft.rfft2(x, norm='ortho')
+        # frequency path (FFT requires float32)
+        xf = x.float() if dtype != torch.float32 else x
+        fft = torch.fft.rfft2(xf, norm='ortho')
         real = torch.unsqueeze(torch.real(fft), dim=-1)
         imag = torch.unsqueeze(torch.imag(fft), dim=-1)
         fft_cat = torch.cat((real, imag), dim=-1)
@@ -194,6 +197,7 @@ class FreqSpatial(nn.Module):
         fft_cat = torch.view_as_complex(fft_cat)
         ff = torch.fft.irfft2(fft_cat, s=(H, W), norm='ortho')
         ff = self.fft_conv2(ff)
+        ff = ff.to(dtype)
 
         return self.final_conv(sf + ff)
 
