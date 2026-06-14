@@ -184,7 +184,10 @@ class FreqSpatial(nn.Module):
         sf = self.spatial_conv1(sf)
         sf = self.spatial_conv2(sf + x)
 
-        # frequency path (FFT requires float32)
+        # frequency path (FFT not supported on NPU jit, use spatial only)
+        if x.device.type == 'npu':
+            return self.final_conv(sf + sf)  # double spatial when FFT unavailable
+
         xf = x.float() if dtype != torch.float32 else x
         fft = torch.fft.rfft2(xf, norm='ortho')
         real = torch.unsqueeze(torch.real(fft), dim=-1)
