@@ -189,17 +189,18 @@ class FreqSpatial(nn.Module):
             return self.final_conv(sf + sf)  # double spatial when FFT unavailable
 
         xf = x.float() if dtype != torch.float32 else x
-        fft = torch.fft.rfft2(xf, norm='ortho')
-        real = torch.unsqueeze(torch.real(fft), dim=-1)
-        imag = torch.unsqueeze(torch.imag(fft), dim=-1)
-        fft_cat = torch.cat((real, imag), dim=-1)
-        fft_cat = fft_cat.permute(0, 1, 4, 2, 3).reshape(B, C * 2, fft.size(-2), fft.size(-1))
-        fft_cat = self.fft_conv(fft_cat)
-        fft_cat = fft_cat.reshape(B, C, 2, fft.size(-2), fft.size(-1))
-        fft_cat = fft_cat.permute(0, 1, 3, 4, 2).contiguous()
-        fft_cat = torch.view_as_complex(fft_cat)
-        ff = torch.fft.irfft2(fft_cat, s=(H, W), norm='ortho')
-        ff = self.fft_conv2(ff)
+        with torch.amp.autocast('cuda', enabled=False):
+            fft = torch.fft.rfft2(xf, norm='ortho')
+            real = torch.unsqueeze(torch.real(fft), dim=-1)
+            imag = torch.unsqueeze(torch.imag(fft), dim=-1)
+            fft_cat = torch.cat((real, imag), dim=-1)
+            fft_cat = fft_cat.permute(0, 1, 4, 2, 3).reshape(B, C * 2, fft.size(-2), fft.size(-1))
+            fft_cat = self.fft_conv(fft_cat)
+            fft_cat = fft_cat.reshape(B, C, 2, fft.size(-2), fft.size(-1))
+            fft_cat = fft_cat.permute(0, 1, 3, 4, 2).contiguous()
+            fft_cat = torch.view_as_complex(fft_cat)
+            ff = torch.fft.irfft2(fft_cat, s=(H, W), norm='ortho')
+            ff = self.fft_conv2(ff)
         ff = ff.to(dtype)
 
         return self.final_conv(sf + ff)
