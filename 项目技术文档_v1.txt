@@ -1,0 +1,207 @@
+================================================================================
+RT-DETR 融合模型 (FCM + FreqSpatial) 项目技术文档
+================================================================================
+
+一、项目目标
+--------------------------------------------------------------------------------
+在 RT-DETR (DETR-based 实时目标检测器) 基础上，将 FSDETR 和 FCM 项目的创新模块
+融合进模型的 Feature Pyramid Network (FPN/PAN) Neck 中，提升检测精度。
+最终产出可用于学术论文的实验数据。
+
+基线: RT-DETRv2-S (PResNet-R18 主干), COCO 2017, mAP 48.1%
+
+
+二、GitHub 仓库
+--------------------------------------------------------------------------------
+仓库: https://github.com/AssheadXFY/RT-DETR-GPU3050
+三支分支:
+  main  -- 原始代码 (仅含 640→480 配置改动)
+  NPU   -- NPU 自适应版 (torch_npu + torch.cuda + cpu 三端兼容)
+  RH    -- 融合版: NPU适配 + FCM模块 + FreqSpatial模块 + SHAB模块
+
+RH 分支新增文件:
+  rtdetrv2_pytorch/src/nn/backbone/fusion_modules.py   (FCM频+ FreqSpatial)
+  rtdetrv2_pytorch/src/nn/backbone/shab.py              (SHAB注意力块)
+  rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r18vd_120e_coco_fcm.yml
+  rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r18vd_120e_coco_freq.yml
+
+RH 分支修改文件:
+  rtdetrv2_pytorch/src/nn/backbone/__init__.py      (加了2行import)
+  rtdetrv2_pytorch/src/zoo/rtdetr/hybrid_encoder.py (加了_create_fusion_block + fpn_block_type参数)
+  rtdetrv2_pytorch/configs/rtdetrv2/include/dataloader.yml (恢复640分辨率+多尺度)
+
+
+三、核心创新模块
+--------------------------------------------------------------------------------
+
+1. FCM (Feature Cross-layer Modulation) -- 来自 FCM-main
+   - 通道按 1:3 分割
+   - 少量通道做空间细化 (3×3 conv ×2 + 1×1 conv)
+   - 大量通道做语义变换 (1×1 conv)
+   - Spatial Attention 加权空间分支, Channel Attention 加权语义分支
+   - 双向互关注融合 (x33 = spatial(y4)*y3 + channel(y3)*y4)
+
+2. FreqSpatial -- 来自 FSDETR
+   - 空间分支: Scharr边缘检测 → 两次空间卷积
+   - 频率分支: rFFT → 实数/虚数分离 → 频域卷积 → irFFT
+   - 双分支相加后经 1×1 融合
+   - 注意: NPU 不支持复数 JIT, 已加自动 fallback; GPU 上 FFT 需禁用 autocast
+
+3. SHAB (Spatial Hierarchical Attention Block) -- 来自 FSDETR/SHViT (CVPR 2024)
+   - 单头自注意力 (SHSA): 部分通道做 attention, 其余直通
+   - DWConv + SHSA + FFN, 每步有残差链接
+
+4. Block Type 可插拔系统 (hybrid_encoder.py 新增)
+   - fpn_block_type='csp'  → CSPRepLayer (默认)
+   - fpn_block_type='fcm'  → FCMBlock
+   - fpn_block_type='freq' → FreqSpatialBlock
+   命令: 在 HybridEncoder 配置中指定 fpn_block_type: 'fcm' 或 'freq'
+
+
+四、NPU 适配 (NPU 分支, 6个核心文件修改)
+--------------------------------------------------------------------------------
+自动检测逻辑:
+  import torch_npu 成功 → NPU (torch.npu)
+  失败 → torch.cuda 可用 → CUDA
+  失败 → CPU
+
+关键修改:
+  dist_utils.py   : 新增 _get_accelerator() / device_type() / device_module()
+  _solver.py      : torch.device 改为动态
+  _config.py      : GradScaler 改为 torch.npu.amp.GradScaler / torch.amp.GradScaler
+  det_engine.py   : 移除 from torch.cuda.amp; autocast device_type 改为动态
+  amp.py          : @register() class GradScaler wrapper
+  logger.py       : SmoothedValue/all_gather 中的 'cuda' 硬编码移除
+
+
+五、NPU 服务器环境 (已废弃)
+--------------------------------------------------------------------------------
+设备: 2× Ascend 910ProB, Python 3.10, torch_npu 2.1.0
+关键修复:
+  - pip install numpy<2 (torch_npu ATC 编译器依赖 np.float_)
+  - pip install opencv-python-headless (替换 opencv-python, 解决 cv2.typing 污染)
+  - 预训练权重: /root/.cache/torch/hub/checkpoints/ResNet18_vd_pretrained_from_paddle.pth
+  - COCO 数据集路径: 由 XFTP 上传
+
+单卡训练命令 (NPU):
+  python tools/train.py -c configs/rtdetrv2/rtdetrv2_r18vd_120e_coco_fcm.yml \
+    --use-amp --seed=0 \
+    -u train_dataloader.total_batch_size=16 train_dataloader.num_workers=0 \
+       val_dataloader.total_batch_size=16 val_dataloader.num_workers=0
+
+NPU 验证 (预训练权重):
+  结果: mAP 48.1% (精度无损), 推理 0.82s/batch (19.5 FPS)
+  训练: 每 batch 35-37s (FCM 算子编译过多), epoch 0 需数天
+
+结论: NPU 适配成功但训练太慢, 改用云 GPU
+
+
+六、云 GPU 实验室 (当前在跑)
+--------------------------------------------------------------------------------
+平台: AutoDL, 内蒙B区
+配置: RTX 3090 24GB ×1, 14 vCPU (Xeon Gold 6330), 90GB RAM, Ubuntu 22.04
+框架: PyTorch 2.5.1+cu124, Python 3.12 (基础镜像预装)
+COCO: /root/autodl-pub/COCO2017/ (公共数据集, 通过软链接或解压到项目 dataset/coco/)
+
+部署流程:
+  git clone -b RH https://github.com/AssheadXFY/RT-DETR-GPU3050.git
+  cd RT-DETR-GPU3050/rtdetrv2_pytorch
+
+  # COCO 数据集 (使用 autodl 公共数据)
+  cd dataset && rm -rf coco && mkdir -p coco && cd coco
+  unzip /root/autodl-pub/COCO2017/annotations_trainval2017.zip
+  unzip /root/autodl-pub/COCO2017/train2017.zip
+  unzip /root/autodl-pub/COCO2017/val2017.zip
+
+  # 预训练权重 (backbone)
+  mkdir -p /root/.cache/torch/hub/checkpoints
+  wget -O /root/.cache/torch/hub/checkpoints/ResNet18_vd_pretrained_from_paddle.pth \
+    https://github.com/lyuwenyu/storage/releases/download/v0.1/ResNet18_vd_pretrained_from_paddle.pth
+
+  # 环境确认 (不要激活 conda rtdetr -- 它是空的)
+  python -c "import torch; print(torch.__version__)"  # 应输出 2.5.1+cu124
+
+单模型训练命令 (GPU, 1 epoch 测试):
+  python tools/train.py \
+    -c configs/rtdetrv2/rtdetrv2_r18vd_120e_coco_fcm.yml \
+    --use-amp --seed=0 \
+    -u train_dataloader.total_batch_size=16 train_dataloader.num_workers=4 \
+       val_dataloader.total_batch_size=16 val_dataloader.num_workers=4
+
+后台运行 (长时间训练):
+  nohup python tools/train.py \
+    -c configs/rtdetrv2/rtdetrv2_r18vd_120e_coco_freq.yml \
+    --use-amp --seed=0 \
+    -u train_dataloader.total_batch_size=16 train_dataloader.num_workers=4 \
+       val_dataloader.total_batch_size=16 val_dataloader.num_workers=4 \
+       epoches=72 \
+    > /root/autodl-tmp/train_freq_72.log 2>&1 &
+
+查看进度:
+  tail -f /root/autodl-tmp/train_freq_72.log
+  grep "Epoch:" /root/autodl-tmp/train_freq_72.log | tail -3
+  nvidia-smi
+
+确认训练在跑: nvidia-smi 显示 GPU 利用率 >70%
+
+停止训练:
+  ps aux | grep train | grep -v grep
+  kill <PID>
+
+
+七、实验结果
+--------------------------------------------------------------------------------
+1. NPU 验证 (预训练权重):
+   mAP 48.1% (与官方一致, 精度零损失)
+
+2. GPU 3090 epoch 0 对比:
+
+| 模型       | 参数   | 每batch | epoch 0耗时 | lr↓ | AP(1epoch) | AP50 | AP75 | AR@100 |
+|-----------|--------|---------|-------------|------|------------|------|------|--------|
+| FCM       | 20.3M  | 0.46s   | 58min       | 25.9→16.7 | 13.9%      | 21.4%| 14.9%| 48.5%  |
+| FreqSpatial| 69.0M | 0.93s   | 1h54min     | 25.9→15.7 | 17.6%      | 26.3%| 18.9%| 50.8%  |
+
+结论: FreqSpatial 在所有尺度上均优于 FCM, epoch 0 即领先 3.7 mAP
+
+3. 配置说明 (dataloader.yml):
+   训练 Resize: [640, 640]
+   多尺度: [480,512,544,576,608,640,640,640,672,704,736,768,800]
+   验证 Resize: [640, 640]
+
+
+八、NPU vs GPU 速度对比
+--------------------------------------------------------------------------------
+| 模型       | NPU Ascend 910ProB | GPU RTX 3090 | 加速倍数 |
+|-----------|-------------------|--------------|---------|
+| FCM        | ~37s/batch        | 0.46s        | 80x     |
+| FreqSpatial| ~37s/batch        | 0.93s        | 40x     |
+
+NPU 主要瓶颈: FCM 的通道分离+注意力分支产生大量新图变体, JIT 编译几乎无法加速
+GPU 没有编译开销, 直接计算
+
+
+九、常见 Bug 与修复 (按时间顺序)
+--------------------------------------------------------------------------------
+1. Windows torchrun 失败 → 加 --rdzv_backend=c10d --rdzv_endpoint=localhost:0
+2. 首次训练 OpenBLAS 内存爆 → 设 OMP_NUM_THREADS=1 num_workers=0
+3. GradScaler 注册名为 _DeviceGradScaler → 改为 @register() class GradScaler
+4. FCMBlock concat 通道不匹配 → 改为 CSP 双路融合
+5. _ConvBN padding: 1x1 卷积用 padding=0 → 自动计算 padding=(kernel-1)//2
+6. FPN upsampling 尺寸不对齐 (40 vs 42) → F.interpolate 用 size= 替代 scale_factor
+7. cuFFT half 精度+非2次幂尺寸 → torch.amp.autocast('cuda', enabled=False) 包裹
+8. NPU 复数 JIT 不支持 → if x.device.type == 'npu': 跳过频域路径
+9. conda rtdetr 环境是空的 → 用基础镜像自带的 python (不用 conda activate)
+
+
+十、未完成的工作
+--------------------------------------------------------------------------------
+1. FreqSpatial 72 epoch 完整训练 (已启动, 预计6天)
+2. FCM 72 epoch 消融实验
+3. 原版 RT-DETR 基线 72 epoch
+4. FLOPs/FPS 效率表
+5. COCO 检测可视化对比图
+6. 论文写作
+
+================================================================================
+文档版本: v1.0 | 日期: 2026-06-19
+================================================================================
