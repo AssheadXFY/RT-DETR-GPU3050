@@ -309,16 +309,33 @@ def draw_side_by_side_tp_fp(img_a, img_b, label_a, label_b,
     return canvas
 
 
-def draw_gains_composite(image: Image.Image, img_gains: Image.Image,
+def draw_gt_only(image: Image.Image, gt_anns: list):
+    """Draw only GT boxes in yellow on a copy of the image."""
+    im = image.copy()
+    draw = ImageDraw.Draw(im)
+    font = _get_font(14)
+    for ann in gt_anns:
+        x, y, w_box, h_box = ann['bbox']
+        x1, y1, x2, y2 = x, y, x + w_box, y + h_box
+        cls_id = ann['category_id'] - 1
+        name = COCO_CLASSES[cls_id] if cls_id < len(COCO_CLASSES) else f'cls{cls_id}'
+        draw.rectangle([x1, y1, x2, y2], outline='#FFD700', width=2)
+        tb = draw.textbbox((x1, max(0, y1 - 15)), name, font=font)
+        draw.rectangle([tb[0], tb[1], tb[2], tb[3]], fill='#FFD700')
+        draw.text((x1, max(0, y1 - 15)), name, fill='#000000', font=font)
+    return im
+
+
+def draw_gains_composite(img_gt: Image.Image, img_gains: Image.Image,
                          img_b: Image.Image,
                          label_a: str, label_b: str,
                          tp_a, tp_b, n_gt):
-    """Triple: original image + gains highlight + FreqSpatial detection."""
-    w = image.width
+    """Triple: GT-tagged image + gains highlight + FreqSpatial TP/FP."""
+    w = img_gt.width
     gap = 8
     total_w = w * 3 + gap * 2
     header_h = 28
-    total_h = header_h + max(image.height, img_gains.height, img_b.height)
+    total_h = header_h + max(img_gt.height, img_gains.height, img_b.height)
 
     canvas = Image.new('RGB', (total_w, total_h), '#1a1a1a')
     draw = ImageDraw.Draw(canvas)
@@ -328,10 +345,10 @@ def draw_gains_composite(image: Image.Image, img_gains: Image.Image,
     draw.text((w + gap + 8, 4), f'Gains: {label_b} found, {label_a} missed',
               fill='#00FF00', font=font)
     draw.text((w * 2 + gap * 2 + 8, 4),
-              f'{label_b} (TP={tp_b}/{n_gt})',
+              f'{label_b}  TP={tp_b}/{n_gt}  (green=TP red=FP)',
               fill='#44AAFF', font=font)
 
-    canvas.paste(image, (0, header_h))
+    canvas.paste(img_gt, (0, header_h))
     canvas.paste(img_gains, (w + gap, header_h))
     canvas.paste(img_b, (w * 2 + gap * 2, header_h))
     return canvas
@@ -446,6 +463,9 @@ def render_results(results, args):
         suffix = f'rank{rank+1:02d}_{img_id:012d}_dTP{r["tp_diff"]:+d}'
 
         if args.render == 'gains':
+            # GT image
+            img_gt = draw_gt_only(image, r['gt_anns'])
+
             # Gains highlight
             img_gains, gain_c = draw_gains(
                 image,
@@ -459,16 +479,9 @@ def render_results(results, args):
                                r['is_tp_b'],
                                tp_color='#00CC00', fp_color='#FF4444')
 
-            # FreqSpatial full (all predictions)
-            from copy import deepcopy
-            img_freq_all = draw_tp_fp(image,
-                                      r['boxes_b'], r['labels_b'], r['scores_b'],
-                                      np.ones(len(r['boxes_b']), dtype=bool),
-                                      tp_color='#4488FF', fp_color='#4488FF')
-
             # Composite: GT | Gains | FreqSpatial TP+FP
             comp = draw_gains_composite(
-                image, img_gains, img_b,
+                img_gt, img_gains, img_b,
                 args.name1, args.name2,
                 r['tp_a'], r['tp_b'], r['n_gt'])
             comp.save(os.path.join(args.out_dir, f'{suffix}_gains.jpg'), quality=85)
