@@ -34,31 +34,33 @@ Guilin, China\\
 % ===========================================================================
 \begin{abstract}
 Real-time DETR-based detectors achieve competitive speed-accuracy trade-offs,
-yet their feature pyramid network (FPN) necks depend exclusively on spatial-domain convolutions,
-overlooking frequency-domain cues that capture fine-grained textures and global structural patterns.
+yet their feature pyramid network (FPN) necks rely exclusively on spatial-domain convolutions,
+overlooking frequency-domain information that captures fine-grained textures and global structural patterns.
 We propose \textbf{FreqSpatial}, a dual-branch block that fuses Scharr-based edge enhancement
 with FFT-based spectral convolution inside a drop-in CSP-style module.
 Replacing the standard CSPRepLayer in RT-DETRv2's neck with FreqSpatial
-yields a \textbf{+1.45} mAP improvement on COCO~2017 (46.73\% $\to$ 48.18\%)
+yields \textbf{+1.45}~mAP on COCO~2017 (46.73\% $\to$ 48.18\%)
 without altering the backbone or decoder.
-The 72-epoch FreqSpatial model reaches the official 120-epoch RT-DETRv2-S performance,
-demonstrating accelerated convergence through frequency-aware inductive bias.
-A +3.4 mAP advantage at epoch~0 further confirms the intrinsic benefit of spectral processing.
-FreqSpatial is a plug-and-play module compatible with any FPN-style neck; our implementation is open-source.
+The 72-epoch FreqSpatial model matches the official 120-epoch RT-DETRv2-S performance,
+indicating that frequency-aware inductive bias accelerates convergence.
+A +3.4~mAP margin at epoch~0 further supports this conclusion.
+FreqSpatial operates as a drop-in CSP block; the underlying frequency-spatial module
+is architecture-agnostic and may generalise to other FPN-style necks.
+Our implementation is open-source.
 \end{abstract}
 
 % ===========================================================================
 \section{Introduction}
 \label{sec:intro}
 
-Object detection has advanced markedly with the emergence of DETR-based
+Object detection has advanced considerably with the emergence of DETR-based
 architectures~\cite{carion2020detr}, which formulate detection as a set prediction
 problem and eliminate hand-crafted components such as non-maximum suppression
 and anchor generation. RT-DETR~\cite{lv2023detrs} further advances this paradigm
 with a real-time hybrid encoder-decoder that achieves
 competitive speed-accuracy trade-offs. However, the FPN neck in RT-DETR
-depends exclusively on spatial-domain convolutions for multi-scale feature
-fusion. It overlooks frequency-domain information that encodes
+relies exclusively on spatial-domain convolutions for multi-scale feature
+fusion, overlooking frequency-domain information that encodes
 fine-grained textures and structural patterns not easily captured in the spatial domain.
 
 Frequency-domain features represent global structural information independent of
@@ -66,17 +68,17 @@ spatial position. The Fourier transform decomposes spatial signals into orthogon
 frequency components, enabling a model to capture periodic patterns and fine details
 that the spatial domain may attenuate. FSDETR~\cite{fsdetr} recently
 proposed frequency-spatial fusion for DETR-based detection and achieved strong
-results on small-object benchmarks (VisDrone, TinyPerson). FD-RTDETR~\cite{wang2025fdrtdetr}
+results on small-object benchmarks (VisDrone, TinyPerson).
+FD-RTDETR~\cite{wang2025fdrtdetr}
 explored frequency enhancement inside RT-DETR's encoder but reported
 modest gains (+0.7 mAP on COCO). The potential of frequency-spatial fusion
-combining Scharr-based edge extraction with FFT convolution remains underexplored
+that combines Scharr-based edge extraction with FFT convolution remains underexplored
 on large-scale general-purpose detection.
 
-We propose \textbf{FreqSpatial}, a plug-and-play frequency-spatial
+We propose \textbf{FreqSpatial}, a frequency-spatial
 feature enhancement block for the FPN neck of RT-DETR. Building on the
 Scharr edge enhancement and FFT spectral convolution introduced
-in FSDETR, we redesign the module as a CSP-style drop-in block compatible
-with any FPN neck and conduct a large-scale validation
+in FSDETR~\cite{fsdetr}, we redesign the module as a CSP-style drop-in block and conduct a large-scale validation
 on COCO~2017. FreqSpatial uses a dual-branch architecture: a spatial branch
 with Scharr operators for local gradient enhancement, and a frequency branch
 that performs convolution in the Fourier domain to capture global spectral
@@ -86,16 +88,16 @@ replacing standard CSPRepLayer blocks.
 Experiments on COCO~2017 show that the RT-DETRv2-S (PResNet18) baseline reaches
 46.73\% mAP, while FreqSpatial attains \textbf{48.18\% mAP} (+1.45).
 At epoch~0, before any detection training, FreqSpatial achieves 17.8\% mAP
-vs.\ 14.4\% for the baseline (+3.4), confirming the benefit of frequency-aware
-inductive bias.
+vs.\ 14.4\% for the baseline (+3.4), indicating that frequency-aware
+inductive bias provides an immediate advantage.
 
 Our contributions are:
 \begin{enumerate}
 \item We validate frequency-spatial feature fusion at scale on COCO (80 classes,
-  118K images), demonstrating that FreqSpatial generalizes beyond small-object
-  datasets to general-purpose detection (+1.45~mAP).
-\item We redesign the frequency-spatial module as a plug-and-play CSP block that
-  integrates into any FPN-style neck without backbone or decoder changes.
+  118K images), showing that FreqSpatial generalizes beyond small-object
+  benchmarks to general-purpose detection (+1.45~mAP).
+\item We redesign the frequency-spatial module as a CSP drop-in block that
+  integrates into RT-DETR's FPN+PAN neck without backbone or decoder changes.
 \item We provide efficiency analysis, cold-start experiments, ablation against
   attention-based alternatives, and qualitative visualizations, with an open-source
   implementation.
@@ -130,10 +132,11 @@ limited class counts (1--10) and did not evaluate on general-purpose
 detection. FD-RTDETR~\cite{wang2025fdrtdetr} applied frequency enhancement to
 RT-DETR's intra-scale feature interaction, attaining +0.7 mAP on COCO and
 demonstrating the potential of frequency-domain processing for general detection.
-Our work validates frequency-spatial fusion (Scharr + FFT convolution) as a
-plug-and-play CSP neck block at scale---80 classes, 118K images on COCO~2017,
-achieving +1.45 mAP, double the gain of prior frequency-enhanced
-RT-DETR methods.
+Our work adopts FSDETR's Scharr+FFT design and repackages it as a CSP neck block
+for general-purpose detection at scale---80 classes, 118K images on COCO~2017,
+achieving +1.45 mAP. The gain doubles that of FD-RTDETR (+0.7 mAP),
+which applies frequency enhancement to RT-DETR's intra-scale encoder rather than
+the FPN neck.
 
 \subsection{Feature Pyramid Networks}
 
@@ -291,10 +294,15 @@ Metrics: mAP, AP$_{50}$, AP$_{75}$, AP$_S$, AP$_M$, AP$_L$, AR$^{\rm max=100}$.
 Table~\ref{tab:main_results} reports COCO~2017 validation results.
 FreqSpatial achieves \textbf{48.18\% mAP}, a +1.45 improvement over the
 Baseline (46.73\%).
-Gains are consistent across scales: +1.6~AP$_{50}$, +1.5~AP$_{75}$,
+Gains were consistent across scales: +1.6~AP$_{50}$, +1.5~AP$_{75}$,
 +1.6~AP$_M$, +1.5~AP$_L$, and +1.0~AP$_S$.
-At 72 epochs, FreqSpatial reaches the official 120-epoch RT-DETRv2-S performance
-(48.1\%~\cite{lv2024rtdetrv2}), demonstrating accelerated convergence.
+The gain on small objects was smaller than on medium and large objects.
+This pattern is consistent with the cold-start results (Table~\ref{tab:epoch0}),
+where large objects benefit most from frequency-domain features, and suggests
+that global spectral patterns are inherently less informative for small instances.
+At 72 epochs, FreqSpatial matches the official 120-epoch RT-DETRv2-S performance
+(48.1\%~\cite{lv2024rtdetrv2}), reaching comparable accuracy with 40\% fewer
+training epochs.
 
 \begin{table}[t]
 \centering
@@ -321,7 +329,7 @@ $\Delta$ & \textbf{+1.45} & \textbf{+1.6} & \textbf{+1.5} & \textbf{+1.0} & \tex
 
 Table~\ref{tab:epoch0} reports epoch~0 validation, before detection training
 (ImageNet pretrained backbone only). FreqSpatial achieves 17.8\% mAP
-vs.\ 14.4\% for the Baseline (\textbf{+3.4 mAP}). The gain is largest on
+vs.\ 14.4\% for the Baseline (\textbf{+3.4 mAP}). The gain was largest on
 large objects (+6.2~AP$_L$), where global frequency patterns are most informative.
 
 \begin{table}[t]
@@ -350,9 +358,9 @@ Table~\ref{tab:progression} and Fig.~\ref{fig:training_efficiency}(a) track mAP
 during training.
 FreqSpatial reaches 47.49\% by epoch~50, already exceeding the final Baseline
 (46.73\%). mAP plateaus at 48.17\% from epoch~59 onward, with the best result
-of 48.18\% at epoch~71. This trajectory shows faster convergence driven by
-frequency-aware features. Further gains under the current learning rate schedule
-appear limited.
+of 48.18\% at epoch~71. This trajectory indicates faster convergence
+associated with frequency-aware features. Further gains under the current
+learning rate schedule appear limited.
 
 \begin{table}[t]
 \centering
@@ -378,8 +386,8 @@ computational cost.
 FreqSpatial increases parameters from 20.18M to 69.03M and FLOPs from
 30.38G to 118.43G, driven primarily by FFT operations and extra convolutions.
 FPS decreases from 66.4 to 38.5 on an RTX~3090 (1.7$\times$ reduction).
-However, 38.5~FPS remains well above the real-time threshold (>30~FPS), and the
-+1.45~mAP gain offers a favorable accuracy-efficiency trade-off.
+At 38.5~FPS, inference remains above the conventional real-time threshold
+of 30~FPS.
 
 \begin{table}[t]
 \centering
@@ -418,8 +426,9 @@ originally proposed for aerial-image small-object detection in FBRT-YOLO.
 FCM performs channel-wise cross-attention via a 1:3 channel split
 with spatial and channel attention gates. It adds negligible parameters
 (20.33M, +0.15M) but achieves only 13.9\% at epoch~0 (vs.\ 14.4\% Baseline,
-17.8\% FreqSpatial) and reduces FPS to 48.2. This confirms that
-frequency-domain processing, rather than generic attention, drives the
+17.8\% FreqSpatial) and reduces FPS to 48.2. Full 72-epoch FCM training
+is in progress; preliminary cold-start results indicate that
+frequency-domain processing, rather than generic attention, accounts for the
 improvement.
 
 \begin{figure*}[b]
@@ -435,12 +444,34 @@ Green boxes denote objects detected by FreqSpatial missed by Baseline.}
 \subsection{Qualitative Analysis}
 \label{sec:qualitative}
 
-Fig.~\ref{fig:visual} shows detection comparisons.
-FreqSpatial consistently detects objects missed by the Baseline, especially
-in cluttered scenes and partially occluded cases.
-The frequency branch's global receptive field identifies objects with
-ambiguous spatial boundaries, while the Scharr branch improves edge
-localization. Gains (Baseline~$\to$~FreqSpatial) are highlighted in green.
+Fig.~\ref{fig:visual} shows representative detection comparisons.
+FreqSpatial detects objects missed by the Baseline in
+cluttered scenes and partially occluded cases.
+Objects with ambiguous spatial boundaries, where the Baseline fails to
+produce proposals, are recovered by FreqSpatial,
+consistent with the frequency branch's global receptive field.
+Gains (Baseline~$\to$~FreqSpatial) are highlighted in green.
+
+\subsection{Limitations}
+\label{sec:limitations}
+
+Several aspects of this study warrant further investigation and constrain
+the conclusions that can be drawn.
+First, we compared FreqSpatial only against the standard CSPRepLayer baseline;
+a parameter-matched or FLOPs-matched variant (e.g., a wider CSPRepLayer or
+deeper RepConv stack) would more precisely isolate the contribution of
+frequency-domain processing from that of increased model capacity.
+Second, all experiments were conducted on a single dataset (COCO~2017)
+and a single detector architecture (RT-DETRv2-S); cross-architecture
+and cross-dataset validation would test the generality of the frequency-aware
+approach.
+Third, results are reported from single training runs without multi-seed
+statistics; run-to-run variance should be quantified to confirm the
+reliability of the reported gains.
+Fourth, no component-level ablation (e.g., Scharr-only, FFT-only, per-FPN-level
+breakdown) has been conducted to isolate the contribution of each branch.
+Finally, the qualitative comparison is limited to two representative examples
+and would benefit from systematic per-category or per-occlusion-level analysis.
 
 % ===========================================================================
 \section{Conclusion}
@@ -454,14 +485,16 @@ into multi-scale feature fusion.
 
 On COCO~2017, FreqSpatial improves mAP by +1.45 (46.73\% $\to$ 48.18\%),
 reaching the official 120-epoch RT-DETRv2-S performance in only 72 epochs.
-Consistent gains across object scales (+1.0--1.6 AP) and strong cold-start
-performance confirm the effectiveness of frequency-aware inductive bias
-for object detection.
+Consistent gains across object scales (+1.0--1.6~AP) and strong cold-start
+performance (+3.4~mAP at epoch~0) indicate that frequency-aware inductive bias benefits
+general-purpose object detection.
 
-The main limitation is the increased computational cost from FFT operations.
+The main trade-off is the increased computational cost from FFT operations
+(3.9$\times$ FLOPs, 1.7$\times$ latency increase), and the evidence is
+currently limited to one detector architecture and one dataset (Section~\ref{sec:limitations}).
 Future work should pursue more efficient frequency-domain operators,
-adaptive frequency band selection, and extension beyond object detection
-to instance segmentation and panoptic tasks.
+cross-architecture validation, adaptive frequency band selection, and extension to
+instance segmentation and panoptic tasks.
 
 % ===========================================================================
 % ---- Bibliography (placeholder) ----
