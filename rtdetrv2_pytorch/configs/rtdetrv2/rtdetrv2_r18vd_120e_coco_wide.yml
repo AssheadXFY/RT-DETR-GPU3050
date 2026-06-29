@@ -51,4 +51,3 @@ train_dataloader:
         epoch: 117
   collate_fn:
     scales: ~
-  total_batch_size: 32
