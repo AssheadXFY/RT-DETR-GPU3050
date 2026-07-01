@@ -311,7 +311,9 @@ class RTDETRTransformerv2(nn.Module):
                  aux_loss=True,
                  cross_attn_method='default',
                  query_select_method='default',
-                 curriculum_denoising=False):
+                 curriculum_denoising=False,
+                 num_query_groups=1,
+                 query_group_noise=0.1):
         super().__init__()
         assert len(feat_channels) <= num_levels
         assert len(feat_strides) == len(feat_channels)
@@ -349,6 +351,8 @@ class RTDETRTransformerv2(nn.Module):
         self.box_noise_scale = box_noise_scale
         self.curriculum_denoising = curriculum_denoising
         self.current_epoch = 0  # updated by engine before each epoch
+        self.num_query_groups = num_query_groups
+        self.query_group_noise = query_group_noise
         if num_denoising > 0: 
             self.denoising_class_embed = nn.Embedding(num_classes+1, hidden_dim, padding_idx=num_classes)
             init.normal_(self.denoising_class_embed.weight[:-1])
@@ -590,6 +594,41 @@ class RTDETRTransformerv2(nn.Module):
         init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list, enc_topk_logits_list = \
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
 
+        # query perturbation: replicate into K groups with noise for denser supervision
+        if self.training and self.num_query_groups > 1:
+            # split denoising and regular parts
+            if dn_meta is not None:
+                ndn = dn_meta['dn_num_split'][0]
+                dn_content = init_ref_contents[:, :ndn, :]
+                dn_bbox = init_ref_points_unact[:, :ndn, :]
+                reg_content = init_ref_contents[:, ndn:, :]
+                reg_bbox = init_ref_points_unact[:, ndn:, :]
+            else:
+                ndn = 0
+                dn_content, dn_bbox = None, None
+                reg_content = init_ref_contents
+                reg_bbox = init_ref_points_unact
+
+            bs, nq, d = reg_content.shape
+            K = self.num_query_groups
+            noise = torch.randn(bs, nq * K, d, device=reg_content.device) * self.query_group_noise
+            content_multi = reg_content.repeat(1, K, 1) + noise
+            bbox_multi = reg_bbox.repeat(1, K, 1)
+
+            if dn_meta is not None:
+                init_ref_contents = torch.cat([dn_content, content_multi], dim=1)
+                init_ref_points_unact = torch.cat([dn_bbox, bbox_multi], dim=1)
+                # expand attention mask
+                tgt_size = dn_meta['dn_num_split'][0] + nq * K
+                dn_mask_inner = attn_mask[:ndn, :ndn].clone()  # save denoising intragroup mask
+                attn_mask = torch.full([tgt_size, tgt_size], False, dtype=torch.bool, device=reg_content.device)
+                attn_mask[ndn:, :ndn] = True  # group queries can't see denoising
+                attn_mask[:ndn, :ndn] = dn_mask_inner
+                dn_meta = {**dn_meta, 'dn_num_split': [ndn, nq * K]}
+            else:
+                init_ref_contents = content_multi
+                init_ref_points_unact = bbox_multi
+
         # decoder
         out_bboxes, out_logits = self.decoder(
             init_ref_contents,
@@ -605,16 +644,47 @@ class RTDETRTransformerv2(nn.Module):
             dn_out_bboxes, out_bboxes = torch.split(out_bboxes, dn_meta['dn_num_split'], dim=2)
             dn_out_logits, out_logits = torch.split(out_logits, dn_meta['dn_num_split'], dim=2)
 
-        out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}
+        # multi-group: split regular queries back into K groups
+        num_group = self.num_query_groups
+        if self.training and num_group > 1:
+            nq = self.num_queries
+            # out_bboxes: [num_layers, bs, nq*K, 4]
+            # out_logits: [num_layers, bs, nq*K, num_classes]
+            out_bboxes_g = out_bboxes.view(out_bboxes.shape[0], bs, num_group, nq, 4)
+            out_logits_g = out_logits.view(out_logits.shape[0], bs, num_group, nq, out_logits.shape[-1])
 
-        if self.training and self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss(out_logits[:-1], out_bboxes[:-1])
-            out['enc_aux_outputs'] = self._set_aux_loss(enc_topk_logits_list, enc_topk_bboxes_list)
-            out['enc_meta'] = {'class_agnostic': self.query_select_method == 'agnostic'}
+            # last-layer prediction: average across groups for inference
+            out = {'pred_logits': out_logits_g[-1].mean(dim=1),
+                   'pred_boxes': out_bboxes_g[-1].mean(dim=1),
+                   'num_query_groups': num_group}
 
-            if dn_meta is not None:
-                out['dn_aux_outputs'] = self._set_aux_loss(dn_out_logits, dn_out_bboxes)
-                out['dn_meta'] = dn_meta
+            if self.aux_loss:
+                # per-group main outputs for per-group Hungarian matching
+                main_list = [
+                    {'pred_logits': out_logits_g[-1, :, g], 'pred_boxes': out_bboxes_g[-1, :, g]}
+                    for g in range(num_group)
+                ]
+                out['query_group_main'] = main_list
+                # per-group aux outputs: keep them separate for per-group matching
+                aux_split = []
+                for g in range(num_group):
+                    aux_split.append(self._set_aux_loss(
+                        out_logits_g[:-1, :, g], out_bboxes_g[:-1, :, g]))
+                out['query_group_aux'] = aux_split
+                out['enc_aux_outputs'] = self._set_aux_loss(enc_topk_logits_list, enc_topk_bboxes_list)
+                out['enc_meta'] = {'class_agnostic': self.query_select_method == 'agnostic'}
+                if dn_meta is not None:
+                    out['dn_aux_outputs'] = self._set_aux_loss(dn_out_logits, dn_out_bboxes)
+                    out['dn_meta'] = dn_meta
+        else:
+            out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}
+            if self.training and self.aux_loss:
+                out['aux_outputs'] = self._set_aux_loss(out_logits[:-1], out_bboxes[:-1])
+                out['enc_aux_outputs'] = self._set_aux_loss(enc_topk_logits_list, enc_topk_bboxes_list)
+                out['enc_meta'] = {'class_agnostic': self.query_select_method == 'agnostic'}
+                if dn_meta is not None:
+                    out['dn_aux_outputs'] = self._set_aux_loss(dn_out_logits, dn_out_bboxes)
+                    out['dn_meta'] = dn_meta
 
         return out
 

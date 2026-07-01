@@ -32,7 +32,8 @@ class RTDETRCriterionv2(nn.Module):
         gamma=2.0, 
         num_classes=80, 
         boxes_weight_format=None,
-        share_matched_indices=False):
+        share_matched_indices=False,
+        deep_supervision=False):
         """Create the criterion.
         Parameters:
             matcher: module able to compute a matching between targets and proposals
@@ -51,6 +52,7 @@ class RTDETRCriterionv2(nn.Module):
         self.share_matched_indices = share_matched_indices
         self.alpha = alpha
         self.gamma = gamma
+        self.deep_supervision = deep_supervision
 
     def loss_labels_focal(self, outputs, targets, indices, num_boxes):
         assert 'pred_logits' in outputs
@@ -151,7 +153,76 @@ class RTDETRCriterionv2(nn.Module):
         if is_dist_available_and_initialized():
             torch.distributed.all_reduce(num_boxes)
         num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item()
-        
+
+        # query perturbation: per-group loss averaging
+        num_groups = outputs.get('num_query_groups', 1)
+        if num_groups > 1 and 'query_group_aux' in outputs:
+            losses = {}
+            # per-group main loss (last layer)
+            main_outputs_list = outputs['query_group_main']
+            for g in range(num_groups):
+                g_out = main_outputs_list[g]
+                matched = self.matcher(g_out, targets)
+                indices = matched['indices']
+                for loss in self.losses:
+                    meta = self.get_loss_meta_info(loss, g_out, targets, indices)
+                    l_dict = self.get_loss(loss, g_out, targets, indices, num_boxes, **meta)
+                    l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
+                    l_dict = {k + '_g{}'.format(g): v for k, v in l_dict.items()}
+                    losses.update(l_dict)
+
+            # per-group aux loss
+            for g in range(num_groups):
+                group_aux = outputs['query_group_aux'][g]
+                for i, aux_outputs in enumerate(group_aux):
+                    matched = self.matcher(aux_outputs, targets)
+                    indices = matched['indices']
+                    for loss in self.losses:
+                        meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices)
+                        l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes, **meta)
+                        l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
+                        l_dict = {k + '_g{}_aux_{}'.format(g, i): v for k, v in l_dict.items()}
+                        losses.update(l_dict)
+
+            # enc / dn loss (unchanged)
+            if 'enc_aux_outputs' in outputs:
+                assert 'enc_meta' in outputs, ''
+                class_agnostic = outputs['enc_meta']['class_agnostic']
+                if class_agnostic:
+                    orig_num_classes = self.num_classes
+                    self.num_classes = 1
+                    enc_targets = copy.deepcopy(targets)
+                    for t in enc_targets:
+                        t['labels'] = torch.zeros_like(t["labels"])
+                else:
+                    enc_targets = targets
+                for i, aux_outputs in enumerate(outputs['enc_aux_outputs']):
+                    matched = self.matcher(aux_outputs, targets)
+                    indices = matched['indices']
+                    for loss in self.losses:
+                        meta = self.get_loss_meta_info(loss, aux_outputs, enc_targets, indices)
+                        l_dict = self.get_loss(loss, aux_outputs, enc_targets, indices, num_boxes, **meta)
+                        l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
+                        l_dict = {k + f'_enc_{i}': v for k, v in l_dict.items()}
+                        losses.update(l_dict)
+                if class_agnostic:
+                    self.num_classes = orig_num_classes
+
+            if 'dn_aux_outputs' in outputs:
+                assert 'dn_meta' in outputs, ''
+                indices = self.get_cdn_matched_indices(outputs['dn_meta'], targets)
+                dn_num_boxes = num_boxes * outputs['dn_meta']['dn_num_group']
+                for i, aux_outputs in enumerate(outputs['dn_aux_outputs']):
+                    for loss in self.losses:
+                        meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices)
+                        l_dict = self.get_loss(loss, aux_outputs, targets, indices, dn_num_boxes, **meta)
+                        l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
+                        l_dict = {k + f'_dn_{i}': v for k, v in l_dict.items()}
+                        losses.update(l_dict)
+
+            return losses
+
+        # === single-group path (baseline) ===
         # Retrieve the matching between the outputs of the last layer and the targets
         matched = self.matcher(outputs_without_aux, targets)
         indices = matched['indices']
@@ -159,7 +230,7 @@ class RTDETRCriterionv2(nn.Module):
         # Compute all the requested losses
         losses = {}
         for loss in self.losses:
-            meta = self.get_loss_meta_info(loss, outputs, targets, indices)            
+            meta = self.get_loss_meta_info(loss, outputs, targets, indices)
             l_dict = self.get_loss(loss, outputs, targets, indices, num_boxes, **meta)
             l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
             losses.update(l_dict)
@@ -174,6 +245,10 @@ class RTDETRCriterionv2(nn.Module):
                     meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices)
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes, **meta)
                     l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
+                    if self.deep_supervision:
+                        n_aux = len(outputs['aux_outputs'])
+                        layer_weight = min(1.0, 0.3 * (i + 1))
+                        l_dict = {k: v * layer_weight for k, v in l_dict.items()}
                     l_dict = {k + f'_aux_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
 
@@ -212,7 +287,7 @@ class RTDETRCriterionv2(nn.Module):
                     l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
                     l_dict = {k + f'_enc_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
-            
+
             if class_agnostic:
                 self.num_classes = orig_num_classes
 
