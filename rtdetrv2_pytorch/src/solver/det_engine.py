@@ -24,6 +24,12 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     device: torch.device, epoch: int, max_norm: float = 0, **kwargs):
     model.train()
     criterion.train()
+
+    # curriculum denoising: pass epoch to decoder
+    _m = model.module if hasattr(model, 'module') else model
+    if hasattr(_m, 'decoder') and hasattr(_m.decoder, 'set_epoch'):
+        _m.decoder.set_epoch(epoch)
+
     metric_logger = MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)

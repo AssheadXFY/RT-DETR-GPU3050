@@ -307,10 +307,11 @@ class RTDETRTransformerv2(nn.Module):
                  learn_query_content=False,
                  eval_spatial_size=None,
                  eval_idx=-1,
-                 eps=1e-2, 
-                 aux_loss=True, 
-                 cross_attn_method='default', 
-                 query_select_method='default'):
+                 eps=1e-2,
+                 aux_loss=True,
+                 cross_attn_method='default',
+                 query_select_method='default',
+                 curriculum_denoising=False):
         super().__init__()
         assert len(feat_channels) <= num_levels
         assert len(feat_strides) == len(feat_channels)
@@ -346,6 +347,8 @@ class RTDETRTransformerv2(nn.Module):
         self.num_denoising = num_denoising
         self.label_noise_ratio = label_noise_ratio
         self.box_noise_scale = box_noise_scale
+        self.curriculum_denoising = curriculum_denoising
+        self.current_epoch = 0  # updated by engine before each epoch
         if num_denoising > 0: 
             self.denoising_class_embed = nn.Embedding(num_classes+1, hidden_dim, padding_idx=num_classes)
             init.normal_(self.denoising_class_embed.weight[:-1])
@@ -551,20 +554,36 @@ class RTDETRTransformerv2(nn.Module):
         return topk_memory, topk_logits, topk_coords
 
 
+    def set_epoch(self, epoch: int):
+        """Called by engine before each epoch to update curriculum."""
+        self.current_epoch = epoch
+
+    def _get_curriculum_noise(self, base_value, start_mult=1.6, end_mult=0.4, decay_epochs=100):
+        """Linear decay noise multiplier: start_mult→end_mult over decay_epochs."""
+        if not self.curriculum_denoising:
+            return base_value
+        e = self.current_epoch
+        if e >= decay_epochs:
+            return base_value * end_mult
+        mult = start_mult - (e / decay_epochs) * (start_mult - end_mult)
+        return base_value * mult
+
     def forward(self, feats, targets=None):
         # input projection and embedding
         memory, spatial_shapes = self._get_encoder_input(feats)
-        
+
         # prepare denoising training
         if self.training and self.num_denoising > 0:
+            label_noise = self._get_curriculum_noise(self.label_noise_ratio)
+            box_noise = self._get_curriculum_noise(self.box_noise_scale)
             denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = \
                 get_contrastive_denoising_training_group(targets, \
-                    self.num_classes, 
-                    self.num_queries, 
-                    self.denoising_class_embed, 
-                    num_denoising=self.num_denoising, 
-                    label_noise_ratio=self.label_noise_ratio, 
-                    box_noise_scale=self.box_noise_scale, )
+                    self.num_classes,
+                    self.num_queries,
+                    self.denoising_class_embed,
+                    num_denoising=self.num_denoising,
+                    label_noise_ratio=label_noise,
+                    box_noise_scale=box_noise, )
         else:
             denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = None, None, None, None
 

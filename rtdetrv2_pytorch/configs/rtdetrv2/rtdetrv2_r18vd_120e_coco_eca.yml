@@ -7,7 +7,7 @@ __include__: [
 ]
 
 
-output_dir: ./output/rtdetrv2_r18vd_120e_coco
+output_dir: ./output/rtdetrv2_r18vd_120e_coco_eca
 
 
 PResNet:
@@ -21,6 +21,7 @@ HybridEncoder:
   in_channels: [128, 256, 512]
   hidden_dim: 256
   expansion: 0.5
+  attn_type: eca
 
 
 RTDETRTransformerv2:

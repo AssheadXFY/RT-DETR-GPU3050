@@ -1,469 +1,280 @@
-================================================================================
-RT-DETR 融合模型 (FCM + FreqSpatial) 项目技术文档
-================================================================================
-
-一、项目目标
---------------------------------------------------------------------------------
-在 RT-DETR (DETR-based 实时目标检测器) 基础上，将 FSDETR 和 FCM 项目的创新模块
-融合进模型的 Feature Pyramid Network (FPN/PAN) Neck 中，提升检测精度。
-最终产出可用于学术论文的实验数据。
-
-基线: RT-DETRv2-S (PResNet-R18 主干), COCO 2017, 72 epoch
-官方参考: mAP 48.1% (120 epoch)
-本项目 Baseline: mAP 46.73%
-本项目 FreqSpatial: mAP 48.18%
-
-
-二、GitHub 仓库
---------------------------------------------------------------------------------
-仓库: https://github.com/AssheadXFY/RT-DETR-GPU3050
-
-五个分支:
-  main  -- 原始代码 (仅含 640→480 配置改动)
-  NPU   -- NPU 自适应版 (torch_npu + torch.cuda + cpu 三端兼容)
-  RH    -- 融合版: FCM+FreqSpatial+SHAB + 项目技术文档 + 基线日志
-  JX    -- 基线原版 (CSPRepLayer) + 72 epoch 训练日志 (mAP 46.73%)
-  CX    -- FreqSpatial 改进版 + 72 epoch 训练日志 (mAP 48.18%)
-
-RH 分支新增文件:
-  rtdetrv2_pytorch/src/nn/backbone/fusion_modules.py   (FCM + FreqSpatial)
-  rtdetrv2_pytorch/src/nn/backbone/shab.py              (SHAB注意力块)
-  rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r18vd_120e_coco_fcm.yml
-  rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r18vd_120e_coco_freq.yml
-  rtdetrv2_pytorch/docs/log_baseline_72ep.txt
-  rtdetrv2_pytorch/docs/log_freq_72ep.txt
-  项目技术文档_v1.txt
-
-RH 分支修改文件:
-  rtdetrv2_pytorch/src/nn/backbone/__init__.py
-  rtdetrv2_pytorch/src/zoo/rtdetr/hybrid_encoder.py
-  rtdetrv2_pytorch/configs/rtdetrv2/include/dataloader.yml
-
-
-三、核心创新模块
---------------------------------------------------------------------------------
-
-1. FCM (Feature Cross-layer Modulation) -- 来自 FCM-main
-   - 通道按 1:3 分割
-   - 少量通道做空间细化 (3×3 conv ×2 + 1×1 conv)
-   - 大量通道做语义变换 (1×1 conv)
-   - Spatial Attention 加权空间分支, Channel Attention 加权语义分支
-   - 双向互关注融合 (x33 = spatial(y4)*y3 + channel(y3)*y4)
-
-2. FreqSpatial -- 来自 FSDETR
-   - 空间分支: Scharr边缘检测 → 两次空间卷积
-   - 频率分支: rFFT → 实数/虚数分离 → 频域卷积 → irFFT
-   - 双分支相加后经 1×1 融合
-   - 注意: NPU 不支持复数 JIT, 已加自动 fallback; GPU 上 FFT 需禁用 autocast
-
-3. SHAB (Spatial Hierarchical Attention Block) -- 来自 FSDETR/SHViT (CVPR 2024)
-   - 单头自注意力 (SHSA): 部分通道做 attention, 其余直通
-   - DWConv + SHSA + FFN, 每步有残差链接
-
-4. Block Type 可插拔系统 (hybrid_encoder.py 新增)
-   - fpn_block_type='csp'  → CSPRepLayer (默认, 基线)
-   - fpn_block_type='fcm'  → FCMBlock
-   - fpn_block_type='freq' → FreqSpatialBlock
-
-
-四、训练配置说明
---------------------------------------------------------------------------------
-关键配置文件: rtdetrv2_pytorch/configs/rtdetrv2/include/
-
-1. dataloader.yml:
-   - 训练 Resize: [640, 640]
-   - 多尺度: [480,512,544,576,608,640,640,640,672,704,736,768,800]
-   - 验证 Resize: [640, 640]
-   - train_dataloader.total_batch_size=16
-   - val_dataloader.total_batch_size=16
-
-2. optimizer.yml:
-   - 优化器: AdamW, lr=0.0001, backbone lr=0.00001
-   - lr_scheduler: MultiStepLR, milestones=[1000], gamma=0.1
-     注意: milestones=[1000] 是为120epoch设计的, 72epoch时全程无lr衰减
-   - warmup: LinearWarmup, 2000步
-   - use_amp: True, use_ema: True
-
-3. 模型配置:
-   - PResNet18, hidden_dim=256
-   - HybridEncoder: in_channels=[128,256,512], feat_strides=[8,16,32]
-   - enc_act='gelu', expansion=0.5, depth_mult=1, act='silu'
-   - RTDETRTransformerv2: num_layers=3, num_queries=300, num_denoising=100
-   - criterion: RTDETRCriterionv2, losses=[vfl, boxes], use_focal_loss=True
-
-
-五、训练服务器环境
---------------------------------------------------------------------------------
-
-服务器1 (Baseline, container-778a4ea2cd-343930bd):
-  AutoDL, RTX 3090 24GB ×1, 20 vCPU, 90GB RAM, Ubuntu 22.04
-  PyTorch 2.5.1+cu124, Python 3.12, CUDA 13.0, Driver 580.105.08
-  状态: Baseline 72 epoch 已完成 (best mAP 46.73% @ epoch 71)
-
-服务器2 (FreqSpatial, container-9d764ea661-effdb907):
-  AutoDL, 内蒙B区, RTX 3090 24GB ×1, 14 vCPU, 90GB RAM
-  PyTorch 2.5.1+cu124, Python 3.12, CUDA 12.8, Driver 570.124.04
-  状态: FreqSpatial 72 epoch 已完成 (best mAP 48.18% @ epoch 71)
-
-
-六、部署流程 (新服务器)
---------------------------------------------------------------------------------
-1. 克隆代码:
-   git clone -b RH https://github.com/AssheadXFY/RT-DETR-GPU3050.git
-   cd RT-DETR-GPU3050/rtdetrv2_pytorch
-
-2. COCO 数据集 (AutoDL 公共数据):
-   cd dataset && mkdir -p coco && cd coco
-   unzip /root/autodl-pub/COCO2017/annotations_trainval2017.zip
-   unzip /root/autodl-pub/COCO2017/train2017.zip
-   unzip /root/autodl-pub/COCO2017/val2017.zip
-   或后台解压: nohup unzip ... &
-   注意: 必须在 dataset/coco/ 下, 不能在项目根目录的 coco/
-
-3. 预训练权重:
-   mkdir -p /root/.cache/torch/hub/checkpoints
-   wget -O /root/.cache/torch/hub/checkpoints/ResNet18_vd_pretrained_from_paddle.pth \
-     https://github.com/lyuwenyu/storage/releases/download/v0.1/ResNet18_vd_pretrained_from_paddle.pth
-   或从其他服务器 scp / 手动上传
-
-4. 环境依赖:
-   pip install scipy faster-coco-eval
-   python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
-   不要激活 conda rtdetr (它是空的, 用系统自带的 python)
-
-
-七、训练命令
---------------------------------------------------------------------------------
-
-1. 基线训练 (fpn_block_type=csp, 默认):
-   nohup python tools/train.py \
-     -c configs/rtdetrv2/rtdetrv2_r18vd_120e_coco.yml \
-     --use-amp --seed=0 \
-     -u train_dataloader.total_batch_size=16 train_dataloader.num_workers=4 \
-        val_dataloader.total_batch_size=16 val_dataloader.num_workers=4 \
-        epoches=72 \
-     > /root/autodl-tmp/train_baseline_72.log 2>&1 &
-
-2. FreqSpatial 训练:
-   nohup python tools/train.py \
-     -c configs/rtdetrv2/rtdetrv2_r18vd_120e_coco_freq.yml \
-     --use-amp --seed=0 \
-     -u train_dataloader.total_batch_size=16 train_dataloader.num_workers=4 \
-        val_dataloader.total_batch_size=16 val_dataloader.num_workers=4 \
-        epoches=72 \
-     > /root/autodl-tmp/train_freq_72.log 2>&1 &
-
-3. FCM 训练 (待执行):
-   nohup python tools/train.py \
-     -c configs/rtdetrv2/rtdetrv2_r18vd_120e_coco_fcm.yml \
-     --use-amp --seed=0 \
-     -u train_dataloader.total_batch_size=16 train_dataloader.num_workers=4 \
-        val_dataloader.total_batch_size=16 val_dataloader.num_workers=4 \
-        epoches=72 \
-     > /root/autodl-tmp/train_fcm_72.log 2>&1 &
-
-4. 查看进度:
-   tail -f /root/autodl-tmp/train_xxx_72.log
-   grep "Epoch:" /root/autodl-tmp/train_xxx_72.log | tail -3
-   ps aux | grep train | grep -v grep
-   nvidia-smi
-
-5. 提取验证 AP:
-   grep -A 15 "IoU metric: bbox" /root/autodl-tmp/train_xxx_72.log | tail -25
-
-6. 停止/确认后台: nohup 断开SSH不中断, kill <主进程PID> 停止
-
-
-八、磁盘管理 (重要)
---------------------------------------------------------------------------------
-每台 50G 数据盘, COCO数据集~20G + checkpoint每个1.1G:
-  数据盘: /root/autodl-tmp/    系统盘: / (30G仅放代码)
-
-清理重复数据:
-  cd ~/autodl-tmp/RT-DETR-GPU3050/rtdetrv2_pytorch
-  rm -rf train2017/ annotations/ val2017/ coco/
-
-清理旧 checkpoint (只保留最新5个):
-  cd ~/autodl-tmp/RT-DETR-GPU3050/rtdetrv2_pytorch/output/<实验名>/
-  ls -t checkpoint*.pth | tail -n +6 | xargs rm -f
-
-checkpoint不是论文数据, 删掉不影响。论文需要的数据:
-  - /root/autodl-tmp/train_xxx_72.log    (训练日志)
-  - output/.../eval/                     (COCO评估文件)
-  - output/.../summary/                  (TensorBoard)
-  - output/.../log.txt                   (训练指标记录)
-
-
-九、实验结果
---------------------------------------------------------------------------------
-
-1. 模型参数量:
-   | 模型        | 参数量  |
-   |------------|--------|
-   | Baseline   | 20.2M  |
-   | FCM        | 20.3M  |
-   | FreqSpatial| 69.0M  |
-
-2. GPU 3090 速度对比:
-   | 模型        | 每batch | epoch耗时  | 显存    |
-   |------------|--------|-----------|---------|
-   | Baseline   | 0.30s  | ~37min    | 8.7GB   |
-   | FCM        | 0.46s  | ~58min    | ~8GB    |
-   | FreqSpatial| 0.93s  | ~1h54min  | 14.6GB  |
-
-3. Epoch 0 验证结果:
-   | 指标         | Baseline | FCM   | FreqSpatial | Freq vs Base |
-   |-------------|:--------:|:-----:|:-----------:|:------------:|
-   | mAP         | 14.4%    | 13.9% | 17.6%       | +3.2         |
-   | AP50        | 21.8%    | 21.4% | 26.3%       | +4.5         |
-   | AP75        | 15.6%    | 14.9% | 18.9%       | +3.3         |
-   | AP_small    | 9.7%     | 8.6%  | 9.8%        | +0.1         |
-   | AP_medium   | 17.9%    | 16.4% | 20.7%       | +2.8         |
-   | AP_large    | 18.3%    | 18.3% | 24.5%       | +6.2         |
-   | AR@100      | 48.6%    | 48.5% | 50.8%       | +2.2         |
-   总结: FreqSpatial epoch 0领先基线3.2 mAP; FCM低于基线; Freq大目标增益最大
-
-4. 72 Epoch 最终结果:
-   | 指标         | Baseline (best/71) | FreqSpatial (best/71) | 提升    |
-   |-------------|:------------------:|:---------------------:|:------:|
-   | mAP         | 46.73%             | 48.18%                | +1.45  |
-   | AP50        | 63.6%              | 65.2%                 | +1.6   |
-   | AP75        | 50.6%              | 52.1%                 | +1.5   |
-   | AP_small    | 29.8%              | 30.8%                 | +1.0   |
-   | AP_medium   | 49.9%              | 51.5%                 | +1.6   |
-   | AP_large    | 62.7%              | 64.2%                 | +1.5   |
-   | AR@100      | 69.5%              | 70.3%                 | +0.8   |
-   | 训练耗时     | 1天22小时           | 5天17小时              | 3x     |
-
-   FreqSpatial mAP 48.18% 追平官方RT-DETRv2-S (48.1%, 120 epoch),
-   本项目仅用72 epoch且无lr衰减。
-
-5. FreqSpatial 中期验证:
-   - Epoch 50: mAP 47.49% (已超过Baseline最终 46.73%)
-   - Epoch 59: mAP 48.17%
-   - Epoch 67: mAP 48.17%
-   - Epoch 71: mAP 48.18% (best)
-
-6. 与官方差距说明:
-   官方 120 epoch, 本项目 72 epoch (少40%训练量)
-   官方 lr有衰减, 本项目全程lr=0.0001不变
-   因此 Baseline 46.73% vs 官方 48.1% 属于合理差异
-   论文核心是同条件对比, 基线即为 46.73%
-
-
-十、GitHub 操作
---------------------------------------------------------------------------------
-每台新服务器首次需要:
-  git config --global user.email "2316861994@qq.com"
-  git config --global user.name "AssheadXFY"
-
-推送需要 Personal Access Token (密码登录已禁用):
-  生成: https://github.com/settings/tokens → Generate new token (classic)
-  勾选 repo, 生成后复制 token (ghp_开头)
-  git push → Username: AssheadXFY, Password: <粘贴token>
-  Token 不要发在聊天里, 泄露后立即删除重新生成
-
-创建新分支:
-  git checkout -b <name>
-  git push origin <name>
-
-跨分支拉取文件:
-  git fetch origin <source-branch>
-  git checkout origin/<source-branch> -- <file-path>
-
-HTTP2/网络问题:
-  git -c http.version=HTTP/1.1 push    (降级HTTP/1.1)
-  curl -I https://github.com            (测连通性)
-
-注意: 别删 token, 多台服务器共用一个
-
-
-十一、NPU 相关 (已废弃)
---------------------------------------------------------------------------------
-NPU vs GPU:
-  FCM: NPU ~37s/batch vs GPU 0.46s (80x)
-  FreqSpatial: NPU ~37s/batch vs GPU 0.93s (40x)
-  NPU 验证 mAP 48.1% 精度无损, 但训练太慢已废弃
-
-
-十二、常见 Bug 与修复
---------------------------------------------------------------------------------
-1. Windows torchrun 失败 → --rdzv_backend=c10d --rdzv_endpoint=localhost:0
-2. OpenBLAS 内存爆 → OMP_NUM_THREADS=1 num_workers=0
-3. GradScaler 注册名错误 → @register() class GradScaler
-4. FCMBlock concat 通道不匹配 → CSP双路融合
-5. _ConvBN 1x1 padding → 自动 padding=(kernel-1)//2
-6. FPN 尺寸不对齐 → F.interpolate 用 size= 替代 scale_factor
-7. cuFFT half精度 → autocast('cuda', enabled=False) 包裹
-8. NPU 复数JIT → x.device.type=='npu' 时跳过频域
-9. conda rtdetr 空的 → 用系统python
-10. ModuleNotFoundError → pip install scipy faster-coco-eval
-11. COCO路径错误 → 必须在 dataset/coco/ 非项目根
-12. GitHub密码认证 → 用Personal Access Token
-13. 数据盘满 → 清理旧checkpoint+重复数据
-14. HTTP2 framing error → git -c http.version=HTTP/1.1 push
-15. Token泄露 → 立即删除重新生成
-
-
-十三、当前进度
---------------------------------------------------------------------------------
-已完成:
-  [✓] FCM 1 epoch (13.9%)
-  [✓] FreqSpatial 1 epoch (17.6%)
-  [✓] Baseline 72 epoch (46.73%, JX分支)
-  [✓] FreqSpatial 72 epoch (48.18%, CX分支)
-
-待完成:
-  [ ] FCM 72 epoch 消融实验
-  [ ] FLOPs/FPS 效率表
-  [ ] COCO 检测可视化对比图
-  [ ] 论文写作
-
-================================================================================
-十四、论文写作进度 (2026-06-26 ~ 2026-06-28)
-================================================================================
-
-1. 论文全文 (paper.tex)
-   位置: rtdetrv2_pytorch/tools/ 同级, 即项目根目录下的 paper.tex
-   模板: IEEEtran (IEEE 顶刊格式), 编译器 pdfLaTeX (TeX Live 2026)
-   当前页数: 约5页 (4 pages + figures)
-   编译命令: pdflatex -interaction=nonstopmode paper.tex (跑两遍解决引用)
-
-2. 论文结构
-   Abstract → Introduction → Related Work (DETR系列 / 频域学习 / FPN)
-   → Method (Preliminaries / FreqSpatialBlock / FreqSpatialModule / Design Rationale)
-   → Experiments (Setup / Main Results / Cold-Start / Training Dynamics / Efficiency / Ablation / Qualitative)
-   → Conclusion → References (15篇)
-
-3. 定量结果表 (已写入 paper.tex)
-   表1: 72 epoch COCO val 主结果 (Baseline 46.73% → FreqSpatial 48.18%, +1.45 mAP)
-   表2: Epoch 0 冷启动 (FreqSpatial 17.6% vs Baseline 14.4%, +3.2)
-   表3: 训练过程 mAP (Epoch 0→50→59→67→71)
-   表4: 效率对比 (Params/GFLOPs/FPS/Latency)
-
-4. 参考文献 (15篇, 全部真实)
-   carion2020detr: ECCV 2020 (DETR)
-   lv2023detrs: CVPR 2024 (RT-DETR v1)
-   lv2024rtdetrv2: arXiv 2407.17140 (RT-DETRv2)
-   zhu2020deformable: ICLR 2021 (Deformable DETR)
-   zhang2022dino: ICLR 2023 (DINO)
-   lin2017fpn: CVPR 2017 (FPN)
-   liu2018panet: CVPR 2018 (PANet)
-   tan2020efficientdet: CVPR 2020 (EfficientDet)
-   wang2020cspnet: CVPRW 2020 (CSPNet)
-   qin2021fcanet: ICCV 2021 (FcaNet)
-   rao2021global: NeurIPS 2021 (GFNet)
-   xiao2025fbrt: AAAI 2025 (FBRT-YOLO, FCM来源)
-   fsdetr: IJCNN 2026 (FSDETR, FreqSpatial来源)
-   wang2025fdrtdetr: Electronics 2025 (FD-RTDETR, 直接竞争者, +0.7 mAP COCO)
-   lin2014microsoft: ECCV 2014 (COCO数据集)
-
-5. 关键事实核查
-   - RT-DETRv2-S 官方 mAP = 48.1% (120 epoch, 来源: lyuwenyu/RT-DETR GitHub)
-   - FSDETR 论文在 IJCNN 2026, VisDrone/TinyPerson 数据集, 从无 COCO 结果
-   - FCM 来自 FBRT-YOLO (AAAI 2025), 航拍小目标检测
-   - FD-RTDETR 是唯一直接竞争者: 频率增强 RT-DETR, mAP 45.1 (+0.7), 本文 48.18 (+1.45)
-   - FreqSpatialBlock 替换 CSPRepLayer 在 FPN+PAN 的 B/C/D/E 四个融合块
-   - AIFI (A 块) 不动, Backbone 不动, Decoder 不动
-
-================================================================================
-十五、图表状态
-================================================================================
-
-Figure 1 (合图 figure1+2.png):
-   - (a) FreqSpatial 模块架构: 用 draw.io 绘制, 导出为 figure1.drawio.svg
-     输入 X^Input → 空间分支 (Scharr Edge → Conv 3×3 → +残差 → Conv 3×3 → F_spatial)
-                      → 频率分支 (rFFT2D → Re/Im Split → Concat 2C → Conv 3×3 → irFFT2D → Conv 3×3 → F_freq)
-                     → Sum → Conv 1×1 → X^Output
-   - (b) RT-DETR Hybrid Encoder + FS Blocks: 用 draw.io 绘制, 导出为 figure2.svg
-     三行: C₃→Proj→FS②→P₃ | C₄→Proj→FS①→FS③→P₄ | C₅→Proj→AIFI→FS④→P₅
-     蓝箭头↑(上采样), 红箭头↓(下采样)
-     虚线框: Frequency-Enhanced Hybrid Encoder
-     四种块: 灰色(Backbone), 浅蓝(Projection), 绿色(AIFI), 橙色(FS Block)
-   - 最终合成为 figure1+2.png, 论文中以 figure1+2.png 引入
-
-Figure 2 (Figure 3 placeholder):
-   - 定性检测对比图 (占位符, 待从服务器 output/compare/ 下载后替换)
-   - 当前: \fbox placeholder 在 Qualitative Analysis 节
-
-图形文件清单:
-   figure1.drawio.svg  -- draw.io 源文件 (FreqSpatial 模块)
-   figure1.svg         -- 导出版本
-   figure1.pdf         -- pdf 导出
-   figure2.svg         -- draw.io 导出版本 (Encoder)
-   figure2.pdf         -- pdf 导出
-   figure1+2.png       -- 最终合图 (论文当前使用)
-   draw_figure1.py     -- matplotlib 尝试 (已废弃, 未使用)
-
-工作流程: draw.io 修改 → 导出 PDF → 覆盖 figure2.pdf → 告知"换图了"
-          → 自动执行: pdfcrop --margins 10 + pdflatex ×2
-   注意: draw.io 源文件 (.drawio.svg) 中的修改不会自动同步到导出的 SVG/PDF
-
-================================================================================
-十六、LaTeX 编译注意事项
-================================================================================
-
-1. 文件依赖
-   paper.tex 依赖: figure1+2.png (在相同目录下)
-   不再依赖: figure1.pdf, figure2.pdf, TikZ (所有TikZ代码已删除)
-
-2. 已知问题和修复
-   - \[ 误写: Python脚本替换时把 \\[\baselineskip] 吞成 \[\baselineskip],
-     导致 "Not in outer par mode" 错误. 必须保留双反斜杠.
-   - pdfcrop 裁剪过度: draw.io 的 SVG→PDF 转换后, pdfcrop 无 margins 会切到内容.
-     解决: pdfcrop --margins 10 figure2.pdf
-   - subfigure → 单图: 因两张子图高度对齐困难, 最终改为用 draw.io 合成一张图.
-   - IEEEtran 下 figure* 跨两栏, figure 单栏.
-   - .log 文件报错时先查 paper.log, grep 搜索 "Error" 定位.
-
-3. 论文已有包
-   graphicx, amsmath, amssymb, booktabs, multirow, caption, subcaption,
-   xcolor, float, cite, tikz (目前只用于占位图和已废弃尝试, 可考虑删除)
-
-================================================================================
-十七、已安装的 Claude Code Skills
-================================================================================
-
-目录: ~/.claude/skills/ (Windows: C:\Users\86138\.claude\skills\)
-
-来自 academic-research-skills (Imbad0202):
-   deep-research/       -- 文献综述
-   academic-paper/      -- 论文大纲/撰写/LaTeX
-   academic-paper-reviewer/ -- 多人同行评审
-   academic-pipeline/   -- 端到端写作流水线
-
-来自 nature-skills (Yuan1z0825):
-   nature-writing/      -- Nature 级论文章节写作
-   nature-polishing/    -- 学术英语润色
-   nature-figure/       -- Nature 风格图表
-   nature-reviewer/     -- 投稿前审稿评估
-   nature-reader/       -- 论文精读
-   nature-citation/     -- CNS 级引用检索
-   nature-response/     -- 审稿 rebuttal
-   nature-paper2ppt/    -- 论文转 PPT
-   nature-data/         -- Data Availability 声明
-   nature-academic-search/ -- PubMed 搜索
-   nature-paper-to-patent/ -- 论文转专利
-
-来自 scipilot-figure-skill (Haojae):
-   scipilot-figure-skill/ -- 科研数据可视化顾问 (只做数据图, 不做架构图)
-
-注意: /plugin 命令在该版本 Claude Code 中不可用, 手动安装方式为 git clone 后 cp -r skills/* ~/.claude/skills/
-
-================================================================================
-十八、下一步待办
-================================================================================
-
-[✓] Figure 1 (FreqSpatial 模块 + Encoder) -- 已完成
-[✓] Figure 1 caption -- 已精简
-[ ] Figure 2 (可视化对比) -- 占位符, 需从服务器下载
-[ ] FLOPs/FPS 效率表 (已跑完, 数据已有, 需确认论文中已更新)
-[ ] 定性分析文字更新
-[ ] 全文润色 (可用 nature-polishing skill)
-[ ] 投稿前审稿评估 (可用 nature-reviewer skill)
-[ ] 确认所有实验数据与论文一致
-
-================================================================================
-文档版本: v3.0 | 日期: 2026-06-28
-更新: 论文全文 (IEEEtran), Figure 1+2 合图, Skills 安装, LaTeX 编译修复
-================================================================================
+===============================================================================
+  FreqSpatial 项目技术文档 v2.0  —  可直接作为新对话上下文
+  更新: 2026-06-29 (含审稿预演/实验进展/服务器状态)
+===============================================================================
+
+-------------------------------------------------------------------------------
+1. 项目概述
+-------------------------------------------------------------------------------
+项目: FreqSpatial: Plug-and-Play Frequency-Spatial Feature Enhancement for RT-DETR
+作者: Feiyang Xie, 桂林电子科技大学 (2316861994@qq.com)
+论文格式: IEEEtran (10pt, twocolumn), 5页, 15篇参考文献
+仓库: https://github.com/AssheadXFY/RT-DETR-GPU3050.git (分支: RH)
+本地路径: d:\github project\RT-DETR-main\RT-DETR-main
+论文文件: paper.tex + paper.pdf (同目录)
+关联项目: d:\github project\FSDETR-main, d:\github project\FCM-main
+
+核心贡献: 用 Scharr边缘检测 + FFT频谱卷积 双分支模块替换 RT-DETRv2 的 CSPRepLayer,
+         COCO 2017 mAP +1.45 (46.73%→48.18%), 参数量 20.18M→69.03M
+
+-------------------------------------------------------------------------------
+2. 论文各节内容
+-------------------------------------------------------------------------------
+Abstract:
+  - RT-DETR的FPN颈仅依赖空间域卷积, 忽略频率域信息
+  - FreqSpatial: Scharr + FFT 双分支 CSP drop-in 模块
+  - +1.45 mAP (46.73%→48.18%), 72轮匹配官方120轮性能
+  - Epoch 0 +3.4 mAP margin 支持频率先验结论
+  - 开源, 架构无关, 可推广到其他FPN颈
+
+Introduction:
+  P1: DETR进展, RT-DETR的FPN颈只依赖空间卷积 → gap
+  P2: 频率域特征优势, FSDETR(小目标), FD-RTDETR(+0.7 COCO) → underexplored
+  P3: FreqSpatial 方案 (基于FSDETR的Scharr+FFT, CSP封装, COCO验证)
+  P4: 实验结果预览 (+1.45 mAP, epoch-0 +3.4)
+  贡献: (1)COCO大规模验证 (2)CSP drop-in设计 (3)效率/冷启动/消融/定性分析
+
+Related Work (3小节):
+  (1) Real-Time DETR: DETR→Deformable DETR→DINO→RT-DETR→RT-DETRv2
+  (2) 频域特征学习: FcaNet, GFNet, FSDETR(小目标), FD-RTDETR(COCO +0.7)
+      "adopts FSDETR's Scharr+FFT and repackages as CSP neck block"
+  (3) FPN: FPN, PANet, BiFPN, CSPNet
+
+Method (4小节):
+  (1) Preliminaries: Hybrid Encoder (AIFI + FPN+PAN)
+  (2) FreqSpatialBlock: CSP双路径公式, FreqSpatial瓶颈×3
+  (3) FreqSpatial Module: Scharr分支 + FFT分支 + 1×1 fusion
+  (4) Design Rationale: 互补信息, drop-in替换
+
+Experiments (7小节):
+  Setup: COCO 2017, PResNet18, AdamW, bs=16, 640×640, 72轮, RTX 3090 ×1
+  Main Results: Table 1
+  Cold-Start: Table 2 (epoch 0, ImageNet backbone only)
+  Training Dynamics: Table 3 + Figure 2(a)
+  Efficiency: Table 4 + Figure 2(b)
+  Ablation: FCM vs FreqSpatial (FCM 72轮 "in progress")
+  Qualitative: Figure 3 (2 samples)
+
+Limitations (5条):
+  1. 无参数匹配基线 (Wide Baseline训练中, 将解决)
+  2. 单数据集单架构
+  3. 单次训练无多种子统计
+  4. 无组件消融 (Scharr-only, FFT-only)
+  5. 定性分析仅2例
+
+Conclusion:
+  +1.45 mAP, 72轮达120轮性能, cold-start +3.4
+  主要trade-off: 3.9× FLOPs, 1.7× latency
+  未来: 高效频域算子, 跨架构验证, 自适应频带选择
+
+语言风格注意事项:
+  审稿预演后已做hedging: "indicates/suggests/accounts for" 替代
+  "confirms/demonstrates/drives", 已scope "any FPN neck" 到实际测试范围
+
+-------------------------------------------------------------------------------
+3. 所有表格数据 (必须100%精确)
+-------------------------------------------------------------------------------
+
+Table 1 — Main Results (COCO 2017 val, 72 epochs):
+| Method            | mAP  | AP50 | AP75 | APS | APM  | APL  | AR100 |
+|-------------------|------|------|------|-----|------|------|-------|
+| Official (120ep)  | 48.1 | --   | --   | --  | --   | --   | --    |
+| Baseline          | 46.73| 63.6 | 50.6 | 29.8| 49.9 | 62.7 | 69.5  |
+| FreqSpatial       | 48.18| 65.2 | 52.1 | 30.8| 51.5 | 64.2 | 70.3  |
+| Delta             |+1.45 | +1.6 | +1.5 |+1.0 | +1.6 | +1.5 | +0.8  |
+
+Table 2 — Cold-Start (Epoch 0):
+| Method      | mAP | AP50 | AP75 | APS | APM  | APL  |
+|-------------|-----|------|------|-----|------|------|
+| Baseline    | 14.4| 21.8 | 15.6 | 9.7 | 17.9 | 18.3 |
+| FCM         | 13.9| 21.4 | 14.9 | 8.6 | 16.4 | 18.3 |
+| FreqSpatial | 17.8| 26.3 | 18.9 | 9.8 | 20.7 | 24.5 |
+| Delta(vsBas)|+3.4 | +4.5 | +3.3 |+0.1 | +2.8 | +6.2 |
+
+Table 3 — Training Dynamics:
+| Method      | Ep 0 | Ep 50 | Ep 59 | Ep 67 | Ep 71  |
+|-------------|------|-------|-------|-------|--------|
+| Baseline    | 14.4 | 45.8  | 46.1  | 46.4  | 46.73  |
+| FreqSpatial | 17.8 | 47.49 | 48.17 | 48.17 | 48.18  |
+
+Table 4 — Efficiency (RTX 3090, 640×640, batch=1):
+| Method            | Params(M) | GFLOPs | FPS  | Latency(ms) |
+|-------------------|-----------|--------|------|-------------|
+| Baseline(CSPRep)  | 20.18     | 30.38  | 66.4 | 15.1        |
+| FCM               | 20.33     | 30.76  | 48.2 | 20.8        |
+| FreqSpatial       | 69.03     | 118.43 | 38.5 | 26.0        |
+
+数据来源: 服务器训练日志, FreqSpatial epoch 0=17.8% (不是17.6%, 已修正)
+FCM 72轮: 论文 "in progress", 完整结果待跑完
+Wide Baseline: 训练中, 参数量 67.97M
+
+Table LaTeX 格式 (booktabs三线表, @{\extracolsep{\fill}} 自动填满列宽):
+  Table 1: @{}l@{\extracolsep{\fill}}ccccccc@{}
+  Table 2: @{}l@{\extracolsep{\fill}}cccccc@{}
+  Table 3: @{}l@{\extracolsep{\fill}}ccccc@{}
+  Table 4: @{}l@{\extracolsep{\fill}}cccc@{}
+
+-------------------------------------------------------------------------------
+4. 图片
+-------------------------------------------------------------------------------
+Figure 1 (figure1+2.png): 跨栏 figure*[t]
+  (a) FreqSpatial模块: Scharr+Conv→Residual→Conv + rFFT2D→Split→Conv→irFFT2D→Add→1×1
+  (b) RT-DETR encoder: C3-C5→Project 256d→AIFI(green)→4×FS Blocks(orange) FPN+PAN
+
+Figure 2 (figure_training_efficiency.pdf): 跨栏 figure*[t], 7.16in×3.4in, Okabe-Ito配色
+  (a) 训练曲线: FreqSpatial蓝实线(圆点) vs Baseline橙实线(菱形), 灰线=最终mAP
+  (b) 效率散点: Baseline(46.73,66.4) vs FreqSpatial(48.18,38.5)
+
+Figure 3 (figure3-1.png + figure3-2.png): 跨栏 figure*[b]
+  定性对比: (左)GT (中)Baseline (右)FreqSpatial, 绿框=FreqSpatial找回的漏检
+
+绘图脚本: draw_figure_training_efficiency.py (内含完整72点mAP数据)
+
+-------------------------------------------------------------------------------
+5. 配置文件
+-------------------------------------------------------------------------------
+位置: rtdetrv2_pytorch/configs/rtdetrv2/
+
+Baseline (rtdetrv2_r18vd_120e_coco.yml):
+  HybridEncoder: in_channels=[128,256,512], hidden_dim=256, expansion=0.5
+  Decoder: num_layers=3
+  Training: bs=16, 72 epochs, 7392 steps/epoch
+
+FreqSpatial (rtdetrv2_r18vd_120e_coco_freq.yml):
+  唯一差异: fpn_block_type='freq'
+
+FCM (rtdetrv2_r18vd_120e_coco_fcm.yml):
+  唯一差异: fpn_block_type='fcm', 参数量20.33M
+
+Wide Baseline (rtdetrv2_r18vd_120e_coco_wide.yml):  【参数匹配消融】
+  HybridEncoder: hidden_dim=512, expansion=1.0, dim_feedforward=2048
+  Decoder: hidden_dim=512, feat_channels=[512,512,512]
+  参数量: 67.97M (target: 69M FreqSpatial)
+  训练: bs=16 (已从total_batch_size:32修正), 与Baseline完全一致
+
+共享 (include/rtdetrv2_r50vd.yml):
+  HybridEncoder默认: hidden_dim=256, expansion=1.0, dim_feedforward=1024
+  Decoder默认: feat_channels=[256,256,256], hidden_dim=256, num_layers=6
+
+训练超参 (include/optimizer.yml):
+  AdamW: lr=1e-4, backbone_lr=1e-5, betas=[0.9,0.999], weight_decay=1e-4
+  EMA: decay=0.9999, warmups=2000
+  MultiStepLR: milestones=[1000], gamma=0.1
+  LinearWarmup: 2000 iterations
+
+-------------------------------------------------------------------------------
+6. 源码关键点
+-------------------------------------------------------------------------------
+fusion_modules.py (src/nn/backbone/):
+  FreqSpatial类:
+    - ScharrConv: 固定卷积核, G_x/G_y, 无learnable参数, groups=channels
+    - Spatial path: Scharr → Conv3×3 → +x → Conv3×3
+    - Frequency path: rFFT2D(norm='ortho') → separate real/imag → concat
+      → Conv3×3 → view_as_complex → irFFT2D → Conv3×3
+    - Fusion: element-wise add + 1×1 Conv
+    - 关键: AMP autocast disabled for FFT (cuFFT不支持half precision)
+    - NPU fallback: device=='npu'时仅使用空间分支
+  FreqSpatialBlock: CSP双路径, N=3×FreqSpatial
+  FCMBlock: 同样CSP, N=3×FCM, 1:3通道split+空间/通道交叉注意力
+
+hybrid_encoder.py (src/zoo/rtdetr/):
+  _create_fusion_block(): 工厂, block_type决定FreqSpatialBlock/FCMBlock/CSPRepLayer
+  CSPRepLayer: in→2×(1×1 Conv), path_a→RepVggBlock×N→add path_b→1×1 out
+  HybridEncoder: input_proj→AIFI(Transformer on stride-32)→FPN(top-down)→PAN(bottom-up)
+
+presnet.py (src/nn/backbone/):
+  PResNet18: depth=18, variant='d'(3×3 stem), 输出channels=[128,256,512]
+  ImageNet预训练权重: PaddlePaddle格式 (ResNet18_vd_pretrained_from_paddle.pth)
+
+-------------------------------------------------------------------------------
+7. AutoDL 服务器状态
+-------------------------------------------------------------------------------
+旧实例: container-778a4ea2cd-343930bd
+  GPU: RTX 3090 × 1
+  运行中: FCM 72轮训练 (screen: fcm_train)
+  日志: /root/autodl-tmp/train_fcm_72.log
+  代码路径: ~/autodl-tmp/RT-DETR-GPU3050/rtdetrv2_pytorch
+
+新实例: container-1814459b44-6ab80f97
+  GPU: RTX 3090 × 1
+  运行中: Wide Baseline 72轮训练 (nohup)
+  日志: /root/autodl-tmp/train_wide_72.log
+  代码路径: ~/RT-DETR-GPU3050/rtdetrv2_pytorch (RH分支)
+  数据集: /root/autodl-pub/COCO2017 → 解压到 /root/autodl-tmp/coco/
+
+SSH: connect.nmb2.seetacloud.com (AutoDL), 端口在 ~/.ssh/config 中
+
+查看进度:
+  tail -f /root/autodl-tmp/train_fcm_72.log     # 旧实例
+  tail -f /root/autodl-tmp/train_wide_72.log    # 新实例
+
+-------------------------------------------------------------------------------
+8. Git 状态
+-------------------------------------------------------------------------------
+分支: RH
+远端: https://github.com/AssheadXFY/RT-DETR-GPU3050.git
+最新commit: e2f08b9 (Fix wide Baseline: remove total_batch_size)
+本地未push: 1个commit (paper.tex表格格式修改, 未add)
+push状态: 间歇性可push (本地网络有时443不通)
+
+-------------------------------------------------------------------------------
+9. 审稿预演结果
+-------------------------------------------------------------------------------
+主要问题及处理:
+
+已解决(文字修改):
+  - "any FPN neck" → "RT-DETR's FPN+PAN neck" ✓
+  - FSDETR归属明确: "adopts FSDETR's Scharr+FFT design and repackages" ✓
+  - 新增Limitations小节(5条) ✓
+  - Qualitative: "consistently"→"representative" ✓
+  - AP_S增益较小(1.0): 解释为与cold-start一致, 全局频谱对小目标信息少 ✓
+
+进行中(实验):
+  - 参数匹配baseline: Wide Baseline 72轮训练中 (67.97M, 接近69M)
+  - FCM完整结果: FCM 72轮训练中
+
+未做:
+  - 组件消融 (Scharr-only, FFT-only, per-FPN)
+  - 多种子统计 (影响±0.1, 非必需)
+  - 跨架构/跨数据集验证
+
+核心论据(为何频率处理有效):
+  1. Epoch 0: FreqSpatial=17.8% vs Baseline=14.4% (无训练的纯结构先验)
+  2. FCM epoch 0: 13.9% (参数几乎不变, 比Baseline还差 — 不是任何操作都涨点)
+  3. Wide Baseline将回答: 纯空间卷积加宽到同参数量能达到什么水平
+
+-------------------------------------------------------------------------------
+10. 待办事项
+-------------------------------------------------------------------------------
+[必须-等训练]
+  1. FCM 72轮跑完 → 提取mAP, 更新Table 2/3/4, 删"is in progress"
+  2. Wide Baseline 72轮跑完 → 加入Table 1/3/4, 图2加第三条曲线
+  3. 更新Limitations (参数匹配实验完成, 删第1条)
+  4. Git push所有更新
+
+[选做]
+  5. 组件消融(需2×72轮×2张GPU)
+  6. 多种子统计(影响小)
+
+数据提取命令:
+  grep "Average Precision  (AP) @\[ IoU=0.50:0.95 | area=   all | maxDets=100 \]" \
+    /root/autodl-tmp/train_{fcm,wide}_72.log | awk -F'=' '{print $NF}' | tr -d ' '
+
+-------------------------------------------------------------------------------
+11. 完整训练曲线数据
+-------------------------------------------------------------------------------
+Baseline (72 epochs, 14.4→46.73):
+[14.4,24.1,27.4,29.8,32.1,33.9,35.3,36.5,37.5,38.2,39.0,39.6,40.2,40.5,40.9,
+ 41.2,41.5,41.8,42.0,42.3,42.5,42.6,42.9,43.0,43.2,43.4,43.6,43.7,43.8,44.0,
+ 44.0,44.1,44.3,44.4,44.5,44.8,44.8,44.9,44.9,45.0,45.1,45.1,45.2,45.4,45.5,
+ 45.5,45.6,45.6,45.7,45.7,45.8,45.9,45.8,45.8,45.8,46.0,46.1,46.2,46.2,46.1,
+ 46.0,46.1,46.2,46.2,46.2,46.3,46.4,46.4,46.4,46.5,46.6,46.7]
+
+FreqSpatial (72 epochs, 17.8→48.18):
+[17.8,26.8,30.0,32.3,34.4,36.0,37.3,38.4,39.5,40.2,40.9,41.4,41.8,42.3,42.6,
+ 43.0,43.4,43.7,43.9,44.1,44.3,44.5,44.8,44.8,45.0,45.3,45.4,45.5,45.7,45.8,
+ 46.0,46.0,46.1,46.1,46.2,46.4,46.4,46.6,46.6,46.8,46.9,46.9,47.0,47.1,47.0,
+ 47.1,47.2,47.2,47.3,47.4,47.5,47.6,47.6,47.6,47.6,47.7,47.7,47.7,47.7,47.8,
+ 47.9,48.0,47.9,48.0,48.1,48.1,48.1,48.2,48.1,48.1,48.1,48.2]
+
+===============================================================================

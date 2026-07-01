@@ -29,20 +29,12 @@ RTDETRTransformerv2:
   num_layers: 3
 
 
-epoches: 1
-
 optimizer:
   type: AdamW
   params:
     -
+      params: '^(?=.*backbone)(?!.*norm).*$'
+      lr: 0.00001
+    -
       params: '^(?=.*(?:norm|bn)).*$'
       weight_decay: 0.
-
-train_dataloader:
-  dataset:
-    transforms:
-      policy:
-        epoch: 117
-  collate_fn:
-    scales: ~
-  total_batch_size: 32

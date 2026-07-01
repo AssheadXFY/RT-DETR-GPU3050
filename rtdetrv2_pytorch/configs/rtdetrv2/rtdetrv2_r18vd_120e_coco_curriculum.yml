@@ -7,7 +7,7 @@ __include__: [
 ]
 
 
-output_dir: ./output/rtdetrv2_r18vd_120e_coco
+output_dir: ./output/rtdetrv2_r18vd_120e_coco_curriculum
 
 
 PResNet:
@@ -25,6 +25,7 @@ HybridEncoder:
 
 RTDETRTransformerv2:
   num_layers: 3
+  curriculum_denoising: True
 
 
 epoches: 120

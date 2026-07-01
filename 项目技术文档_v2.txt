@@ -1,0 +1,357 @@
+===============================================================================
+  RT-DETR 项目技术文档 v3.0 — 当前状态 & 下一步计划
+  更新: 2026-06-29
+===============================================================================
+
+-------------------------------------------------------------------------------
+1. 项目回顾 — FreqSpatial 失败经验
+-------------------------------------------------------------------------------
+项目: FreqSpatial: Plug-and-Play Frequency-Spatial Feature Enhancement for RT-DETR
+作者: Feiyang Xie, 桂林电子科技大学
+仓库: https://github.com/AssheadXFY/RT-DETR-GPU3050.git (分支: RH)
+本地路径: d:\github project\RT-DETR-main\RT-DETR-main
+
+核心问题:
+  (a) FreqSpatial 69M vs Baseline 20M，参数量 3.4×，涨点 +1.45 mAP。
+      未做参数匹配消融实验——不知道涨点来自频域分支还是参数堆叠。
+  (b) Epoch 0 冷启动: Wide Baseline (68M 纯空间) = 20.1% > FreqSpatial (69M) = 17.8%。
+      证明了 FreqSpatial 的冷启动优势不存在，增益大概率来自参数容量。
+  (c) 对比的对象错了——官方 RT-DETRv2-S (R18, 20M) = 47.9%/48.1%，
+      FreqSpatial (69M) = 48.18%，实际只高出 0.28 点。
+
+核心教训:
+  1. 任何"涨点"必须先做同参数量对照实验（Wide Baseline）
+  2. 先把 baseline 复现到官方的水平再谈改进
+  3. 配置文件的覆盖项不要乱加（scales: ~, epoch: 117 是 120 轮设计）
+
+-------------------------------------------------------------------------------
+2. 当前状态
+-------------------------------------------------------------------------------
+
+2.1 服务器（旧实例 container-778a4ea2cd-343930bd）
+  GPU: RTX 3090 × 1
+  运行中: Baseline 120 轮训练（resume from epoch 71 checkpoint）
+  日志: /root/autodl-tmp/train_baseline_120e.log
+  代码路径: /root/autodl-tmp/RT-DETR-GPU3050/rtdetrv2_pytorch
+  COCO数据集: /root/autodl-tmp/RT-DETR-GPU3050/rtdetrv2_pytorch/dataset/coco/
+  预计完成: 约 2 天
+  目标: mAP = 48.1% (RT-DETRv2-S 官方数值)
+
+2.2 配置验证（已完成）
+  配置文件: rtdetrv2_r18vd_120e_coco.yml
+  - 逐行对比官方 lyuwenyu/RT-DETR，完全一致
+  - 源码 diff: 10 个文件有改动，但 KEY 路径（forward/logic）功能等同
+  - 预训练权重: 与官方同源
+  - 结论: 服务器代码功能上等同于官方
+
+2.3 已实现模块（本地，未推送到服务器）
+  位置: src/nn/backbone/attn_modules.py
+  三个 attention 模块，均通过 shape 测试:
+  - ECA (CVPR 2020): 5 params/实例，1D conv 通道注意力
+  - SimAM (ICML 2021): 0 params，能量函数注意力
+  - EMA (ICASSP 2023): ~21K params/实例，分组卷积+跨组softmax
+
+  插入位置: HybridEncoder 的 7 个点（3 input_proj + 2 FPN + 2 PAN）
+  修改文件: src/zoo/rtdetr/hybrid_encoder.py（加了 attn_type 参数）
+  配置文件已创建:
+  - rtdetrv2_r18vd_120e_coco_eca.yml
+  - rtdetrv2_r18vd_120e_coco_simam.yml
+  - rtdetrv2_r18vd_120e_coco_ema.yml
+  默认行为: attn_type=None（不影响 Baseline）
+
+-------------------------------------------------------------------------------
+3. 创新点验证框架 — "三步试金石"
+-------------------------------------------------------------------------------
+
+第一步：查户口
+  去 arXiv / Google Scholar / GitHub 搜关键词
+  判断: 找到一篇七八分像的 = 不算创新
+
+第二步：打一架
+  对手: 最简单经典的方法（不是SOTA）
+  战场: 最小的标准数据集
+  规则: 除idea外所有设置完全一致
+  判断: 连最菜基线都打不过 = 放弃
+
+第三步：拆零件
+  实验A: 基线（无idea）
+  实验B: 基线 + idea
+  判断: B不显著优于A = idea是装饰，不是创新
+
+最常犯的错误:
+  1. "我觉得没人做过" → 大概率搜得不够深
+  2. "数学公式很复杂所以是创新" → 简化才叫创新
+  3. "等实验做完再说" → 第一个小实验就该告诉答案
+
+烟雾测试:
+  花 2-3 天在小数据集上快速验证，不行就立刻换方向。
+  快速证伪 > 缓慢证实。
+
+-------------------------------------------------------------------------------
+4. 下一步实验计划
+-------------------------------------------------------------------------------
+
+4.1 Baseline 120 轮跑完后
+  [必须] 确认 mAP 达到 48.1%（官方复现成功）
+  [必须] 保存 checkpoint 作为后续实验基座
+
+4.2 快速烟雾测试（COCO epoch 0, 每项 ~1 小时）
+  测试对象: ECA / SimAM / EMA（均使用 120 轮官方配置）
+  Baseline epoch 0 冷启动 = 14.4% (历史数据)
+  判断标准: 有明显提升 → 继续；持平或更差 → 放弃该模块
+
+4.3 考虑 VisDrone 数据集（遥感小目标）
+  场景: 小目标密集、低光照 → 与 neck attention 方向天然适配
+  优势: COCO 太卷，VisDrone 竞争较小，涨点更容易显著
+  EI 会议标准: 两个创新点 + 清晰的 story 即可
+
+-------------------------------------------------------------------------------
+5. 资料路径
+-------------------------------------------------------------------------------
+论文文件: paper.tex + paper.pdf
+配置文件位置: rtdetrv2_pytorch/configs/rtdetrv2/
+  - rtdetrv2_r18vd_120e_coco.yml          (Baseline)
+  - rtdetrv2_r18vd_120e_coco_eca.yml       (ECA attention)
+  - rtdetrv2_r18vd_120e_coco_simam.yml     (SimAM attention)
+  - rtdetrv2_r18vd_120e_coco_ema.yml       (EMA attention)
+  - rtdetrv2_r18vd_120e_coco_freq.yml      (FreqSpatial, 已死)
+  - rtdetrv2_r18vd_120e_coco_fcm.yml       (FCM, 已关)
+  - rtdetrv2_r18vd_120e_coco_wide.yml      (Wide Baseline, 已停)
+
+源码关键文件:
+  - src/zoo/rtdetr/hybrid_encoder.py   (neck, 插attention的位置)
+  - src/nn/backbone/attn_modules.py     (ECA/SimAM/EMA 实现)
+  - src/nn/backbone/fusion_modules.py   (FCM/FreqSpatial 实现)
+  - src/nn/backbone/presnet.py          (PResNet backbone)
+
+-------------------------------------------------------------------------------
+6. 调参方法论 — 不要上来就改模型
+-------------------------------------------------------------------------------
+
+6.1 先诊断：没学会 vs 背答案
+  训练loss下不去 → 模型没学会 → 加大模型/学习率/减少正则化
+  训练loss下去了、验证集不行 → 过拟合 → 加数据/数据增强/正则化
+  方向搞反 = 越调越糟
+
+6.2 数据优先（70%精力）
+  - 修正训练集里标错的 5% 标签，效果可能比加 20% 数据还好
+  - 看模型总是猜错的样本 → 大概率是标注错了或图片本身模糊
+  - MixUp（两张图叠加训练）和 CutMix（一张图贴到另一张）稳定涨点
+  - 别只用简单翻转裁剪
+
+6.3 优化器（20%精力）
+  - 固定学习率基本是错的 → 余弦退火更好
+  - EMA（指数移动平均）：零成本提点技巧
+  - 标签平滑：不让模型太自信，防过拟合
+
+6.4 模型集成（简单粗暴）
+  - 5 个不同种子的同一模型取平均 → +1~2 个点
+  - 测试时对同一张图做不同增强取平均 → +0.5~1 个点
+
+6.5 三原则
+  (1) 一次只改一个东西
+  (2) 先 100% 复现 baseline，再谈改进
+  (3) 死磕涨不动 0.2% 时 = 该换方向了
+
+6.6 精力分配：70% 数据清洗增强 + 20% 优化器 + 10% 模型结构
+
+-------------------------------------------------------------------------------
+7. 低成本创新策略 — 五种不用重新发明轮子的方法
+-------------------------------------------------------------------------------
+
+7.1 缝合两个老方法
+  A方法解决A问题，B方法搞定B场景 → 在C任务上同时用
+  关键: 想清楚为什么它俩该在一起、各自解决什么痛点
+  验证: 对比实验证明组合 > 单独用任何一个
+  Motivation 清晰 = 你的贡献成立
+
+7.2 换个地盘用老方法
+  方法在甲领域已烂大街 → 搬到乙领域就是创新
+  别照搬: 损失函数改、预处理调、针对新领域做适配
+  对比对象: 跟乙领域的现有方法比，赢了就行
+
+7.3 盯着论文 Limitation
+  读论文最后"本文不足"那一节 → 作者自己说了哪里不行
+  针对这个缺口设计方案 → 目标明确、Motivation 现成
+  审稿人会觉得"顺理成章"
+
+7.4 蹭新数据集
+  刚放出来的 Benchmark 还没人跑过 → 把主流方法全跑一遍
+  现有方法在新数据上表现一般 → 随便改点预处理就领先
+  模型不动，靠数据和训练策略占坑
+
+7.5 不动结构，只改训练方法
+  数据增强、损失函数、优化流程 → 够发
+  对比学习、知识蒸馏 → 本质都是训练环节创新
+  关键: 讲清楚为什么这么训更合理（理论或实验站住一个即可）
+
+-------------------------------------------------------------------------------
+8. 备选创新方案（趁 Baseline 120 轮跑着）
+-------------------------------------------------------------------------------
+
+8.1 方案A: 轻量 Attention 插入 Neck（策略: 换地盘）
+  - 把 ECA/SimAM/EMA 搬到 RT-DETR 的 FPN neck
+  - Motivation: 投影后的特征图缺少通道显著性 / 空间重要性校准
+  - 实现: 已有一行配置 `attn_type: eca/simam/ema`，代码完成
+  - 验证: epoch 0 冷启动 > baseline 14.4% 即可继续
+  - 风险: 低（代码现成，一个 epoch 出结果）
+  - 烟雾测试: 1小时/个，三个模块各跑 epoch 0
+
+8.2 方案B: AIFI 扩展到多尺度（策略: 盯 Limitation）
+  - RT-DETR 的 AIFI 只对 P5 做 intra-scale self-attention
+  - 问题: P3(80×80)、P4(40×40) 的高分辨率特征没被精细化
+  - 改法: use_encoder_idx=[0,1,2]，P3/P4 用更轻量的编码（1 layer, 2 head）
+  - 预期: 小目标 APS 提升，neck 之后特征质量更高
+  - 风险: 中（需改 HybridEncoder，但改动集中在一个 for 循环）
+  - 烟雾测试: epoch 0 vs baseline
+
+8.3 方案C: 余弦退火学习率（策略: 不动结构，改训练）
+  - 当前: MultiStepLR, milestones=[1000]，120轮里只在约 epoch 16 降一次
+  - 换成 CosineAnnealing + LinearWarmup
+  - 改法: 换 optimizer.yml 里 lr_scheduler 类型
+  - 零代码、纯配置改动
+  - 风险: 最低
+  - 烟雾测试: epoch 0 看不出，需要跑 5-10 epoch 看 loss 下降趋势
+
+8.4 方案D: VisDrone 小目标迁移（策略: 新数据集）
+  - 用方案A中验证最好的 attention 模块 + VisDrone 数据集
+  - Motivation: VisDrone 小目标密集，neck 特征增强天然适配
+  - 场景: 遥感无人机视角，pedestrian/bicycle/car 密集小目标
+  - 对比对象: RT-DETR baseline on VisDrone（先跑一个 VisDrone baseline）
+  - 风险: 中（需下载数据集、写配置、跑 VisDrone baseline）
+
+优先级: A(即时可测) > C(配置级) > B(需少量改动) > D(需新数据集)
+
+8.5 方案E: Encoder→Decoder 特征直连（策略: 缝合）
+  - AIFI encoder 输出直接加到 decoder 每层 cross-attention 的 value 上
+  - Motivation: encoder 已经做了 intra-scale 精炼，decoder 应该"继承"而非"重新读"
+  - 实现: decoder forward 中加一个 encoder_feat 的 skip connection
+  - 零额外参数（如果直接 add），或加一个微小线性投影（256×256=65K）
+  - 烟雾测试: epoch 0 vs baseline
+
+8.6 方案F: 动态 Query 降噪强度（策略: 改训练方法）
+  - 当前 denoising 的 noise_ratio=0.5 全程不变
+  - 改法: 前 20 epoch 用 0.8（重噪声、强正则化），线性衰减到 72 epoch 后 0.2
+  - Motivation: 前期强降噪帮助学习表征，后期弱降噪让模型专注精调
+  - 零架构改动，只改 config/criterion 里的一个参数调度
+  - 烟雾测试: 需 5-10 epoch 看 loss 曲线
+
+8.7 方案G: R50→R18 知识蒸馏（策略: 改训练方法）
+  - Teacher: RT-DETRv2-M (R50, 官方权重 free, 51.9% mAP)
+  - Student: 你的 R18 baseline
+  - 做法: 加一个 KL/feature distillation loss 在 decoder 输出或 neck 特征上
+  - Story: 用大模型知识引导小模型，R18 逼近 R50 性能
+  - 风险: 中（需加载 teacher 模型、写 distillation wrapper）
+  - 烟雾测试: 需完整训练验证
+
+8.8 方案H: FPN 层自适应空间偏置（策略: 缝合+换地盘）
+  - 为每个 FPN 层(P3/P4/P5) 学习一个 H×W×1 的空间偏置图
+  - Motivation: 不同层级关注不同空间区域，静态 sin-cos PE 不够
+  - 实现: 初始化一个可学习参数 [1, H, W, 1]，上采样到特征尺寸后 add
+  - 参数量: 80×80+40×40+20×20 = 8400，可忽略
+  - Novelty: 不同于标准 PE——这是层自适应、数据驱动的空间先验
+  - 烟雾测试: epoch 0 vs baseline
+
+8.9 方案I: Decoder 逐层深监督（策略: 盯Limitation+改训练）
+  - 当前只对最后一层 decoder 算 loss
+  - 改法: 每层 decoder 输出都加 auxiliary loss（权重随层增加: 0.3, 0.6, 1.0）
+  - Motivation: 加速中间层收敛，梯度直接传导到浅层 decoder
+  - 零架构改动，只改 criterion
+  - 烟雾测试: epoch 0 看各层 loss 下降速度
+
+优先级总结（考虑实现难度和验证速度）:
+  即时可测: A, E, H（epoch 0 见分晓）
+  需少量训练: C, F, I（5-10 epoch 看趋势）
+  需完整实验: B, G, D（跑 120 轮才知结果）
+
+-------------------------------------------------------------------------------
+9. 实现状态（2026-06-29）
+-------------------------------------------------------------------------------
+
+已编码完成:
+  方案A (Neck Attention):
+    - attn_modules.py: EMA/SimAM/ECA 三个模块
+    - hybrid_encoder.py: attn_type 参数，7个插入点（3 input_proj + 2 FPN + 2 PAN）
+    - 配置: _eca.yml, _simam.yml, _ema.yml
+
+  方案F (Curriculum Denoising):
+    - rtdetrv2_decoder.py: curriculum_denoising 参数 + set_epoch() + _get_curriculum_noise()
+      调度: label_noise_ratio 1.6x→0.4x, box_noise_scale 1.5x→0.5x, 线性100epoch衰减
+    - det_engine.py: train_one_epoch 开始时调 set_epoch(epoch)
+    - 配置: _curriculum.yml
+    - 查重: DETR家族首次提出epoch级噪声衰减（DN-DETR固定0.5, DINO固定两值, RHINO动态过滤非衰减）
+
+  方案H (FPN 空间偏置):
+    - hybrid_encoder.py: spatial_bias 参数，3个1-channel偏置图，8400参数
+    - 配置: _spatialbias.yml
+
+-------------------------------------------------------------------------------
+10. 论文叙事框架（审稿人最吃这套）
+-------------------------------------------------------------------------------
+
+三句话逻辑链:
+  1. 讲痛点: 不说"提出新方法"，要说"低光照下行人漏检率35%"这样的真实数字
+  2. 讲短板: 不堆文献，直接点出"现有方法依赖XX，但XX场景下失效"
+  3. 讲价值: 不描述模块，说"XX模块让召回率从62%提到78%"——数据说话
+
+应用到本文:
+  痛点: RT-DETR FPN neck 只依赖 CSP 卷积做融合，多尺度特征在送 decoder 前缺少通道选择性校准
+  短板: 现有 attention（SENet/CBAM）要么重参数、要么只改 backbone，DETR neck 的轻量增强是空白
+  价值: 轻量 attention 插 neck（<1K params），自身 baseline 47.74%→目标值，验证 neck 质量比 decoder 结构更值得优化
+  Table: 三行 — 官方权重(48.1%) | 我们复现(47.74%) | 改进后(X%) — 证明 eval 正确 + 改进有效
+
+-------------------------------------------------------------------------------
+11. 底层优化三策略（不堆模块，动内核）
+-------------------------------------------------------------------------------
+
+11.1 疏通梯度（针对 neck bottleneck 梯度消失）
+  问题: CSPRepLayer 0.5x expansion → hidden=128，梯度通道被压窄
+  做法: attention 查在 CSP 的 conv1 投影后（而非 conv3 输出后），梯度在宽通道传递
+  实现: 改 _create_fusion_block 里 attention 的插入位置，或在 CSP 内部 1x1 proj 之后
+
+11.2 稳定特征（针对 FPN concat 分布不对齐）
+  问题: FPN 里 C4 和上采样 P5 concat 后直接送 fusion block，两个来源的统计分布完全不同
+  做法: concat 之后加一个 LayerNorm(512) 或两个独立 BatchNorm 分别归一化后再 concat
+  实现: 在 hybrid_encoder.py forward 的 concat 和 fusion_block 之间插入
+
+11.3 优化损失（动态平衡多任务 loss）
+  问题: loss_bbox=5, loss_giou=2 写死，回归/分类可能不同速
+  做法: 监控 loss_bbox/loss_vfl 比值，如果 GIoU 显著快于 VFL，动态调权重
+  实现: 在 criterion 里加 loss ratio tracker，每 N step 用 EMA 平滑后自适应调权重
+
+-------------------------------------------------------------------------------
+12. 消融实验升级（不再只做 A/B 对比）
+-------------------------------------------------------------------------------
+
+12.1 证明结构非线性增强
+  别只比 A vs Baseline、B vs Baseline
+  要比: A单独(+0.3) + B单独(+0.5) = 0.8 → 实际 A+B(+1.2) > 0.8 = 非线性增强
+  说明两个模块解决不同的问题，有结构协同
+
+12.2 解释"为什么提升"而不仅是"提升多少"
+  × 错误写法: "ECA 提升了 0.5 mAP"
+  ✓ 正确写法: "FPN 的 RepBlock 在 0.5× expansion 下信息压缩 4 倍，
+              ECA 通过跨通道 1D 卷积恢复了被瓶颈压缩的判别特征，
+              特别是 C4→C3 上采样路径上通道注意力让细节特征不被稀释"
+
+12.3 验证不可替代性（极端场景）
+  标准: COCO val2017 全量
+  极限1: 1/2 训练集（60 epoch）
+  极限2: 加高斯噪声（σ=0.1）到 backbone 输出
+  极限3: 换 backbone（R18→R34, decoder layers 3→2）
+  只有你的模块在所有场景都稳，才是真的不可替代
+
+-------------------------------------------------------------------------------
+13. Baseline 论证策略（47.74% 怎么卖）
+-------------------------------------------------------------------------------
+Table 放三行:
+  行1: RT-DETRv2-S (official weights)  | 48.1 | 我们 eval 官方权重验证 pipeline
+  行2: RT-DETRv2-S (our reproduction) | 47.74 | 同 config, 我们自己训练
+  行3: RT-DETRv2-S + Ours              | X.XX | 所有改进在 baseline 上对比
+
+优势:
+  - 不造假（没宣称复现了 48.1%）
+  - 证明了 eval pipeline 正确（官方权重 = 48.1%）
+  - 公平对比（同一训练环境、同一随机性起点）
+
+===============================================================================

@@ -309,9 +309,8 @@ training epochs.
 \caption{Detection performance on COCO~2017 val. All models based on
 RT-DETRv2-S (PResNet18), trained 72 epochs.~$\Delta$ denotes improvement of FreqSpatial over Baseline.}
 \label{tab:main_results}
-\setlength{\tabcolsep}{2.5pt}
 \footnotesize
-\begin{tabular}{lccccccc}
+\begin{tabular}{@{}l@{\extracolsep{\fill}}ccccccc@{}}
 \toprule
 Method & mAP & AP$_{50}$ & AP$_{75}$ & AP$_S$ & AP$_M$ & AP$_L$ & AR$^{100}$ \\
 \midrule
@@ -336,9 +335,8 @@ large objects (+6.2~AP$_L$), where global frequency patterns are most informativ
 \centering
 \caption{Epoch 0 validation (no detection training).}
 \label{tab:epoch0}
-\setlength{\tabcolsep}{3pt}
 \footnotesize
-\begin{tabular}{lcccccc}
+\begin{tabular}{@{}l@{\extracolsep{\fill}}cccccc@{}}
 \toprule
 Method & mAP & AP$_{50}$ & AP$_{75}$ & AP$_S$ & AP$_M$ & AP$_L$ \\
 \midrule
@@ -366,9 +364,8 @@ learning rate schedule appear limited.
 \centering
 \caption{COCO mAP progression during training.}
 \label{tab:progression}
-\setlength{\tabcolsep}{6pt}
 \footnotesize
-\begin{tabular}{lccccc}
+\begin{tabular}{@{}l@{\extracolsep{\fill}}ccccc@{}}
 \toprule
 Method & Ep~0 & Ep~50 & Ep~59 & Ep~67 & Ep~71 \\
 \midrule
@@ -393,9 +390,8 @@ of 30~FPS.
 \centering
 \caption{Efficiency on RTX 3090 (input $640\times640$, batch=1).}
 \label{tab:efficiency}
-\setlength{\tabcolsep}{4pt}
 \footnotesize
-\begin{tabular}{lcccc}
+\begin{tabular}{@{}l@{\extracolsep{\fill}}cccc@{}}
 \toprule
 Method & Params (M) & GFLOPs & FPS & Latency (ms) \\
 \midrule

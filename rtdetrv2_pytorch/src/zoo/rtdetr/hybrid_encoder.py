@@ -211,7 +211,9 @@ class HybridEncoder(nn.Module):
                  act='silu',
                  eval_spatial_size=None,
                  version='v2',
-                 fpn_block_type='csp'):
+                 fpn_block_type='csp',
+                 attn_type=None,
+                 spatial_bias=False):
         super().__init__()
         self.in_channels = in_channels
         self.feat_strides = feat_strides
@@ -274,6 +276,29 @@ class HybridEncoder(nn.Module):
                                      round(3 * depth_mult), expansion, act)
             )
 
+        # plug-and-play attention modules (after input_proj, FPN blocks, PAN blocks)
+        from ...nn.backbone.attn_modules import create_attn_module
+        num_scales = len(in_channels)
+        self.input_attns = nn.ModuleList([
+            create_attn_module(attn_type, hidden_dim) for _ in range(num_scales)
+        ])
+        self.fpn_attns = nn.ModuleList([
+            create_attn_module(attn_type, hidden_dim) for _ in range(num_scales - 1)
+        ])
+        self.pan_attns = nn.ModuleList([
+            create_attn_module(attn_type, hidden_dim) for _ in range(num_scales - 1)
+        ])
+
+        # learnable per-level spatial bias (scheme H)
+        self.spatial_bias = spatial_bias
+        if spatial_bias:
+            ref_hw = 80  # reference: P3 size
+            # per-level 1-channel bias map, broadcast to hidden_dim (~8.4K params total)
+            self.spatial_biases = nn.ParameterList([
+                nn.Parameter(torch.zeros(1, 1, ref_hw // (2 ** i), ref_hw // (2 ** i)))
+                for i in range(num_scales)
+            ])
+
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -307,7 +332,7 @@ class HybridEncoder(nn.Module):
     def forward(self, feats):
         assert len(feats) == len(self.in_channels)
         proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)]
-        
+
         # encoder
         if self.num_encoder_layers > 0:
             for i, enc_ind in enumerate(self.use_encoder_idx):
@@ -323,6 +348,9 @@ class HybridEncoder(nn.Module):
                 memory :torch.Tensor = self.encoder[i](src_flatten, pos_embed=pos_embed)
                 proj_feats[enc_ind] = memory.permute(0, 2, 1).reshape(-1, self.hidden_dim, h, w).contiguous()
 
+        # plug-and-play: attention after projection
+        proj_feats = [self.input_attns[i](f) for i, f in enumerate(proj_feats)]
+
         # broadcasting and fusion
         inner_outs = [proj_feats[-1]]
         for idx in range(len(self.in_channels) - 1, 0, -1):
@@ -332,6 +360,8 @@ class HybridEncoder(nn.Module):
             inner_outs[0] = feat_heigh
             upsample_feat = F.interpolate(feat_heigh, size=feat_low.shape[-2:], mode='nearest')
             inner_out = self.fpn_blocks[len(self.in_channels)-1-idx](torch.concat([upsample_feat, feat_low], dim=1))
+            # plug-and-play: attention after FPN fusion
+            inner_out = self.fpn_attns[len(self.in_channels)-1-idx](inner_out)
             inner_outs.insert(0, inner_out)
 
         outs = [inner_outs[0]]
@@ -340,6 +370,14 @@ class HybridEncoder(nn.Module):
             feat_height = inner_outs[idx + 1]
             downsample_feat = self.downsample_convs[idx](feat_low)
             out = self.pan_blocks[idx](torch.concat([downsample_feat, feat_height], dim=1))
+            # plug-and-play: attention after PAN fusion
+            out = self.pan_attns[idx](out)
             outs.append(out)
+
+        # layer-adaptive spatial bias (scheme H)
+        if self.spatial_bias:
+            outs = [outs[i] + F.interpolate(self.spatial_biases[i],
+                     size=outs[i].shape[-2:], mode='bilinear', align_corners=False)
+                    for i in range(len(outs))]
 
         return outs

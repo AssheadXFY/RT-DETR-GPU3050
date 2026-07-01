@@ -34,7 +34,7 @@ RTDETRTransformerv2:
   feat_channels: [512, 512, 512]  # match hidden_dim
 
 
-epoches: 1
+epoches: 72
 
 optimizer:
   type: AdamW
