@@ -1,0 +1,167 @@
+======================================================================
+  对话交接文档 — 新对话直接读这个
+  日期: 2026-07-02
+  基于: 对话交接_2026-07-01.txt（必须同时读，包含了历史方案/代码/调研）
+======================================================================
+
+----------------------------------------------------------------------
+1. 本次对话的核心进展
+----------------------------------------------------------------------
+
+1) J 方案完整 smoke test 完成（S2, epoch 0-9）
+   J vs baseline 全程正 delta，收敛但稳定：
+
+   | Epoch | Baseline | J      | Δ       |
+   |-------|----------|--------|---------|
+   | 0     | 14.40%   | 15.43% | +1.03%  |
+   | 1     | 24.07%   | 24.84% | +0.77%  |
+   | 9     | 38.22%   | 38.72% | +0.50%  |
+
+   预估 72 epoch 最终 +0.3~0.4%，即 ~48.1%。
+
+2) 论文方向讨论：J 单独不够
+   - J 只是 RT-DETRv3 三件套中的一个组件（Query Perturbation），
+     缺少 CNN aux head 和 O2M decoder。单独摘出来不够一篇论文。
+   - 需要 J + 1~2 个正交组件的组合。
+
+3) 确定论文组合框架：J + L
+   - J (Query Perturbation): 增加监督密度，每 GT 匹配 K 个 query
+   - L (Denoising Self-Distillation): 提升监督质量，denoising query 做软标签 teacher
+   - 两者正交：J 增加"数量"，L 提升"质量"
+   - 都只训练时生效，推理零开销
+
+4) J+L 决策：先 smoke test (epoch 0-2)，不直接 120 epoch
+   - 之前 S1 的 J+L smoke test 只跑完 epoch 0（loss_kd ~0.02 正常）
+   - epoch 1 被 pkill 中断，没拿到 mAP
+   - S2 现在空闲，准备跑 J+L smoke test 2-3 epoch
+
+----------------------------------------------------------------------
+2. 服务器当前状态
+----------------------------------------------------------------------
+
+服务器1 (container-778a4ea2cd-343930bd):
+  GPU: RTX 3090 × 1
+  代码路径: /root/autodl-tmp/RT-DETR-GPU3050/rtdetrv2_pytorch
+  COCO: /root/autodl-tmp/RT-DETR-GPU3050/rtdetrv2_pytorch/dataset/coco/
+  VisDrone: /root/autodl-tmp/dataset/visdrone/ (软链接)
+  预训练权重: /root/.cache/torch/hub/checkpoints/ResNet18_vd_pretrained_from_paddle.pth
+  GitHub: https://github.com/AssheadXFY/RT-DETR-GPU3050 (分支: RH)
+  磁盘: 50G, 需定期清理 output checkpoint
+  运行中:
+    VisDrone baseline 60-epoch 训练 (train_visdrone_baseline.log)
+    配置: rtdetrv2_r18vd_60e_visdrone.yml
+    启动命令:
+      cd /root/autodl-tmp/RT-DETR-GPU3050/rtdetrv2_pytorch
+      nohup python tools/train.py -c configs/rtdetrv2/rtdetrv2_r18vd_60e_visdrone.yml \
+        -u PResNet.pretrained=/root/.cache/torch/hub/checkpoints/ResNet18_vd_pretrained_from_paddle.pth \
+        -u epoches=60 --use-amp > /root/autodl-tmp/train_visdrone_baseline.log 2>&1 &
+    VisDrone 数据已转换: visdrone_train.json (6471 images), visdrone_val.json (548 images)
+    转换脚本: tools/visdrone_to_coco.py
+
+服务器2 (container-a574409304-809bcb22):
+  GPU: RTX 3090 × 1
+  代码路径: /root/autodl-tmp/RT-DETR-XFY/rtdetrv2_pytorch
+  COCO: /root/autodl-tmp/RT-DETR-XFY/rtdetrv2_pytorch/dataset/coco/
+  预训练权重: /root/.cache/torch/hub/checkpoints/ResNet18_vd_pretrained_from_paddle.pth
+  GitHub: https://github.com/AssheadXFY/RT-DETR-XFY (分支: RH)
+  空闲 (刚停止 J 训练，epoch 0-9 完成)
+  下一步: 跑 J+L smoke test 2-3 epoch
+
+启动命令模板:
+  cd /root/autodl-tmp/RT-DETR-XFY/rtdetrv2_pytorch
+  nohup python tools/train.py -c configs/rtdetrv2/rtdetrv2_r18vd_120e_coco_queryperturb_kd.yml \
+    -u PResNet.pretrained=/root/.cache/torch/hub/checkpoints/ResNet18_vd_pretrained_from_paddle.pth \
+    -u epoches=2 --use-amp > /root/autodl-tmp/smoke_jl.log 2>&1 &
+
+日志查看:
+  grep -A5 "coco_eval_bbox\|Accumulating\|IoU metric\|best_stat" logfile | tail -20
+
+----------------------------------------------------------------------
+3. J 方案原理（供新对话快速理解）
+----------------------------------------------------------------------
+
+问题: RT-DETR 的 O2O Hungarian 匹配 → 每个 GT 只有 1 个正样本 query
+     → 300 query 中大量负样本 → 监督稀疏
+
+J 的机制:
+  训练时:
+    1. topk 选出 300 query（encoder 输出）
+    2. 复制成 K=2 组，content embedding 加高斯噪声 (σ=0.1)
+    3. 300 → 600 query 进 decoder，每组独立做 Hungarian match
+    4. 每 GT 匹配 2 个 query（vs baseline 1 个）
+  推理时: 只用 300 query，K 组输出取平均 → 零额外开销
+
+J vs RT-DETRv3 的关系:
+  RT-DETRv3 = CNN aux head + Query Perturbation + O2M decoder
+  J = 只提取了 Query Perturbation 这一个组件
+  NOT 一模一样，是 RT-DETRv3 的最小核心子集
+
+----------------------------------------------------------------------
+4. J+L 论文框架
+----------------------------------------------------------------------
+
+标题方向: "Training Optimization for Lightweight DETR via Query Diversification and Self-Distillation"
+
+组件:
+  J - Query Perturbation (来源: 摘取自 RT-DETRv3 的 Query Perturbation 组件)
+    原理: K 组 query 复制 + 高斯噪声 → 密集监督
+    改动: rtdetrv2_decoder.py (~40行)
+
+  L - Denoising Self-Distillation [原创]
+    原理: KL loss — 常规 query 的 class logit 模仿同 GT 的 denoising query 预测分布
+          denoising query 知道自己的 GT 身份，其解码输出是高质量软标签
+    改动: rtdetrv2_criterion.py (loss_labels_kd 方法, ~50行)
+    KD 配置: loss_kd weight=0.5, kd_temperature=2.0
+
+消融路径:
+  Baseline → +J → +L → 最终
+  可选升级: J2 (Fourier 域扰动替代高斯噪声，保留空间结构)
+
+代码状态: J 和 L 都已经写好了，criterion 和 decoder 有完整实现。
+  J+L 的 config: rtdetrv2_r18vd_120e_coco_queryperturb_kd.yml
+
+----------------------------------------------------------------------
+5. 下一步行动（按优先级）
+----------------------------------------------------------------------
+
+[ ] 1. S2: 启动 J+L smoke test, epoches=2
+       对比 epoch 0 mAP vs J-only epoch 0 (15.43%) 和 baseline (14.40%)
+       通过标准: J+L epoch 0 >= J-only epoch 0
+
+[ ] 2. S1: 等 VisDrone baseline epoch 0 完成后，检查 mAP
+       VisDrone 上 J vs baseline 的对比，提供跨数据集验证
+
+[ ] 3. 如果 J+L smoke test 通过:
+       - S2 跑 J+L 完整 120 epoch
+       - S1 VisDrone 跑完后跑 J-only 60 epoch
+
+[ ] 4. 如果 J+L 有效但增益小，可试 J2 (Fourier 扰动)
+       当前 noise 是 randn(bs, nq*K, d) — 无结构高斯噪声
+       J2 改为 FFT → 只扰动高频分量 → ~10行改动
+
+----------------------------------------------------------------------
+6. 关键文件索引
+----------------------------------------------------------------------
+
+源码:
+  src/zoo/rtdetr/rtdetrv2_decoder.py   — J 实现（num_query_groups, query_group_noise）
+  src/zoo/rtdetr/rtdetrv2_criterion.py — L 实现（loss_labels_kd, multi-group loss 路径）
+
+配置文件:
+  configs/rtdetrv2/rtdetrv2_r18vd_120e_coco_queryperturb.yml       — J only
+  configs/rtdetrv2/rtdetrv2_r18vd_120e_coco_queryperturb_kd.yml    — J+L
+  configs/rtdetrv2/rtdetrv2_r18vd_60e_visdrone.yml                 — VisDrone baseline
+  configs/rtdetrv2/rtdetrv2_r18vd_60e_visdrone_queryperturb.yml    — VisDrone + J
+  configs/dataset/visdrone_detection.yml                           — VisDrone 数据集配置
+
+工具:
+  tools/visdrone_to_coco.py — VisDrone → COCO 格式转换
+
+参考文档:
+  对话交接_2026-07-01.txt — 历史方案/代码/调研/服务器详情（必须读）
+  项目技术文档_v2.txt     — 完整理论框架
+  CLAUDE.md               — 错误反思 + 行为规则
+  train_baseline_72.log    — baseline 72 epoch 完整日志
+  train_baseline_120e.log  — baseline 续训 72→120 epoch 日志
+
+======================================================================

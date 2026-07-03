@@ -1,0 +1,219 @@
+======================================================================
+  对话交接文档 — 新对话直接读这个
+  日期: 2026-07-03（当日更新）
+  基于: 对话交接_2026-07-01.txt（历史方案/调研/服务器详情）
+        对话交接_2026-07-02.txt（2026-07-02 进展）
+======================================================================
+
+----------------------------------------------------------------------
+1. 2026-07-03 核心进展
+----------------------------------------------------------------------
+
+=== 今日已完成的实验 ===
+
+1a) J+L (KD self-distillation) smoke test — 失败
+    epoch 0 mAP = 14.56% (vs J-only 15.43%, -0.87%)
+    死因: denoising query 在 epoch 0 的预测是随机分布，用垃圾做 teacher → 反向污染
+
+1b) J+Consistency smoke test — 失败
+    epoch 0~2: 15.70%, 24.80%, 28.21% — 全程与 J-only 持平
+    死因: VFL loss 已经把 K 组 query 拉向同一个 GT，consistency loss 是冗余信号
+
+1c) J2 (Fourier 域扰动) — 未跑，用户评估后否决
+    死因: FFT 在 content embedding 上无理据（256d learnable vector 没有频率语义）
+
+1d) ECA backbone — 未跑，用户评估后否决
+    死因: 单个 ECA 模块是 2020 年的东西，换位置放不构成方法论贡献
+
+1e) J+ISFE smoke test — 通过
+    epoch 0: 15.58% (+1.18 vs baseline, +0.15 vs J-only)
+    epoch 1: 24.95% (+0.88 vs baseline, +0.11 vs J-only)
+    持续正 delta，ISFE 不是零贡献
+
+=== 正在进行中的实验 ===
+
+1f) S1: CSCG+J smoke test (smoke_cscg_j.log, epoches=3)
+    配置: rtdetrv2_r18vd_120e_coco_cscg.yml
+    CSCG = Cross-Scale Context Gate：C5→C3/C4 通道门控跨层上下文传播
+
+1g) S2: ISFE-only smoke test (smoke_isfe_only.log, epoches=3)
+    配置: rtdetrv2_r18vd_120e_coco_isfe_only.yml
+    目的: 隔离 ISFE 独立贡献，不混入 J
+
+----------------------------------------------------------------------
+2. 全部实验结果汇总（更新至 2026-07-03）
+----------------------------------------------------------------------
+
+baseline 数据:
+  epoch 0 = 14.40%, epoch 1 = 24.07%, epoch 2 = 27.37%, epoch 9 = 38.22%
+  最终 epoch 117 best = 47.74%
+
+=== 已否决方案 ===
+  A  — ECA/SimAM/EMA in neck (CSP bottleneck 扼杀)
+  H  — FPN 空间偏置 (同 A)
+  I  — 深监督 (方向性错误)
+  C  — Cosine LR (烟雾测试测不到)
+  F  — Curriculum Denoising (噪声调度过激)
+  J+L — Denoising KD (random teacher in cold start)
+  J+Consistency — 跨组一致性 (VFL 已经对齐了)
+  J2 — Fourier 扰动 (content embedding 无频率语义)
+  ECA backbone — 单模块不构成创新
+
+=== 有效方案 ===
+  J — Query Perturbation (K=2)
+
+    | Epoch | Baseline | J      | Δ       |
+    |-------|----------|--------|---------|
+    | 0     | 14.40%   | 15.43% | +1.03%  |
+    | 1     | 24.07%   | 24.84% | +0.77%  |
+    | 2     | 27.37%   | 28.19% | +0.82%  |
+    | 9     | 38.22%   | 38.72% | +0.50%  |
+
+  ISFE — Intra-Scale Feature Enhancement
+    单个模块 epoch 0: pending (S2 正在跑)
+    J+ISFE epoch 0: 15.58%, epoch 1: 24.95%
+
+  CSCG — Cross-Scale Context Gate
+    CSCG+J epoch 0: pending (S1 正在跑)
+
+----------------------------------------------------------------------
+3. 论文方法论（2026-07-03 确立）
+----------------------------------------------------------------------
+
+用户明确了论文创新的五步路径：
+
+  Step 1: 找一篇最新的开源顶会论文作为 baseline，跑通代码，复现结果
+  Step 2: 拆解 baseline 的模块，理解每个模块的作用
+  Step 3: 在同期其它顶会论文中找到功能相似的模块，进行替换（缝合）
+  Step 4: 替换后能跑出相当或更好的结果 → 写论文。
+         写作要隐藏"替换操作"，按 baseline 的叙事逻辑分析领域问题
+  Step 5: 如果能对模块做领域适配（不是原样搬过来），故事更完整
+
+关键原则：单个已有模块不算创新。多个模块的缝合组合 + 特定的协同机制 +
+针对 RT-DETR 具体缺口的设计理由 = 可以。不局限于两个模块。
+
+----------------------------------------------------------------------
+4. 当前论文框架：J + Encoder Enhancement
+----------------------------------------------------------------------
+
+叙事方向: "轻量 DETR 在 encoder 和 decoder 两侧存在不对称瓶颈"
+
+  Decoder 侧 — J (Query Perturbation)
+    解决: O2O matching 监督稀疏
+    机制: 300 query × K=2 groups + Gaussian noise → 每 GT 匹配 2 query
+    改动: rtdetrv2_decoder.py
+
+  Encoder 侧 — 两条候选路线（并行验证中）
+    ISFE: intra-scale — C3/C4 各自增强容量（inverted bottleneck + DWConv）
+    CSCG: cross-scale — C5 transformer 上下文传播到 C3/C4（通道门控）
+
+  最终方案: J + (ISFE 和/或 CSCG)，具体取决于烟雾测试结果
+
+三行 table:
+  行1: RT-DETRv2-S official = 48.1%
+  行2: RT-DETRv2-S our reproduction = 47.74%
+  行3: RT-DETRv2-S + Ours = X%
+
+----------------------------------------------------------------------
+5. 服务器当前状态
+----------------------------------------------------------------------
+
+服务器1 (container-778a4ea2cd-343930bd):
+  GPU: RTX 3090 × 1
+  代码路径: /root/autodl-tmp/RT-DETR-GPU3050/rtdetrv2_pytorch
+  GitHub: https://github.com/AssheadXFY/RT-DETR-GPU3050 (分支: RH)
+  预训练权重: /root/.cache/torch/hub/checkpoints/ResNet18_vd_pretrained_from_paddle.pth
+  运行中: CSCG+J smoke test (smoke_cscg_j.log, epoches=3)
+  配置: rtdetrv2_r18vd_120e_coco_cscg.yml
+  关键文件已更新: rtdetrv2_decoder.py (J), rtdetrv2_criterion.py (multi-group),
+                  hybrid_encoder.py (CSCG+ISFE)
+
+服务器2 (container-a574409304-809bcb22):
+  GPU: RTX 3090 × 1
+  代码路径: /root/autodl-tmp/RT-DETR-XFY/rtdetrv2_pytorch
+  GitHub: https://github.com/AssheadXFY/RT-DETR-XFY (分支: RH)
+  预训练权重: /root/.cache/torch/hub/checkpoints/ResNet18_vd_pretrained_from_paddle.pth
+  运行中: ISFE-only smoke test (smoke_isfe_only.log, epoches=3)
+  配置: rtdetrv2_r18vd_120e_coco_isfe_only.yml
+  仓库已有: decoder (J), criterion (multi-group + KD), hybrid_encoder (ISFE+CSCG)
+
+启动命令模板:
+  cd /root/autodl-tmp/<repo>/rtdetrv2_pytorch
+  nohup python tools/train.py -c configs/rtdetrv2/<config>.yml \
+    -u PResNet.pretrained=/root/.cache/torch/hub/checkpoints/ResNet18_vd_pretrained_from_paddle.pth \
+    -u epoches=N --use-amp > /root/autodl-tmp/<logfile>.log 2>&1 &
+
+日志查看:
+  grep -A5 "coco_eval_bbox\|Accumulating\|IoU metric\|best_stat" logfile | tail -20
+
+----------------------------------------------------------------------
+6. 当前代码状态（三个修改文件）
+----------------------------------------------------------------------
+
+(1) src/zoo/rtdetr/rtdetrv2_decoder.py
+    新增参数: num_query_groups, query_group_noise
+    新增逻辑: multi-group query 复制 + content noise + attn_mask 扩展
+    inference: K 组输出平均 → 零额外开销
+
+(2) src/zoo/rtdetr/rtdetrv2_criterion.py
+    新增方法: loss_labels_kd (L 方案 —— 已验证无效，保留代码)
+            loss_group_consistency (Consistency 方案 —— 已验证无效，保留代码)
+    新增逻辑: multi-group loss 路径（每组独立 Hungarian match + loss）
+
+(3) src/zoo/rtdetr/hybrid_encoder.py
+    新增类: ISFEBlock (intra-scale conv residual, ~267K params each)
+          CSCGBlock (cross-scale channel gate, ~34K params each)
+    新增参数: isfe_enabled, cscg_enabled
+    R18 config: isfe on C3/C4 (use_encoder_idx=[2] → 只有 C5 有 transformer)
+               cscg on C3/C4 (C5 as context source)
+
+(4) src/nn/backbone/presnet.py — 已还原为原始状态（ECA 改动已删除）
+
+----------------------------------------------------------------------
+7. 配置文件清单
+----------------------------------------------------------------------
+
+已有配置:
+  rtdetrv2_r18vd_120e_coco_queryperturb.yml        — J only (K=2)
+  rtdetrv2_r18vd_120e_coco_queryperturb_kd.yml     — J+L (KD)
+  rtdetrv2_r18vd_120e_coco_queryperturb_consist.yml— J+Consistency
+  rtdetrv2_r18vd_120e_coco_queryperturb_fourier.yml— J+J2 (Fourier, J2已否决)
+  rtdetrv2_r18vd_120e_coco_isfe.yml                — J+ISFE
+  rtdetrv2_r18vd_120e_coco_isfe_only.yml           — ISFE only (no J)
+  rtdetrv2_r18vd_120e_coco_cscg.yml                — J+CSCG
+  rtdetrv2_r18vd_60e_visdrone.yml                  — VisDrone baseline
+
+已删除配置:
+  rtdetrv2_r18vd_120e_coco_bb_eca.yml              — ECA backbone
+  rtdetrv2_r18vd_120e_coco_bb_eca_j.yml            — ECA backbone + J
+
+----------------------------------------------------------------------
+8. CLAUDE.md 关键规则
+----------------------------------------------------------------------
+
+提方案前必须通过 六问：
+  1. 机制在 RT-DETR 上下文里成立吗？
+  2. 已有机制在提供等价信号吗？（冗余检查）
+  3. 多个模块组合是否产生新知？（缝合检查）
+  4. 架构有什么具体阻碍？
+  5. 失败时第一个调试信号是什么？
+  6. 验证周期多长？
+
+技术原则:
+  - 优先在 encoder 层面找机会（未被 10 条梯度路径饱和）
+  - 优先改变特征本身或信号结构
+  - 提方案时必须同时回答"它最容易怎么死"
+
+----------------------------------------------------------------------
+9. 下一步行动
+----------------------------------------------------------------------
+
+[进行中] S1 CSCG+J 和 S2 ISFE-only smoke test，约 50 分钟后 epoch 0 出结果
+
+[待定] 根据结果决定:
+  如果 ISFE-only > baseline → ISFE 独立有效 → 论文加 ISFE 段
+  如果 CSCG+J > J-only → CSCG 有效 → 论文加 CSCG 段
+  如果两者都有效 → 可叠加 → J+ISFE+CSCG 三模块组合
+  胜出者跑 120 epoch
+
+======================================================================

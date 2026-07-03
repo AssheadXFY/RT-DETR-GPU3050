@@ -25,15 +25,16 @@ class RTDETRCriterionv2(nn.Module):
     __inject__ = ['matcher', ]
 
     def __init__(self, \
-        matcher, 
-        weight_dict, 
-        losses, 
-        alpha=0.2, 
-        gamma=2.0, 
-        num_classes=80, 
+        matcher,
+        weight_dict,
+        losses,
+        alpha=0.2,
+        gamma=2.0,
+        num_classes=80,
         boxes_weight_format=None,
         share_matched_indices=False,
-        deep_supervision=False):
+        deep_supervision=False,
+        kd_temperature=1.0):
         """Create the criterion.
         Parameters:
             matcher: module able to compute a matching between targets and proposals
@@ -53,6 +54,7 @@ class RTDETRCriterionv2(nn.Module):
         self.alpha = alpha
         self.gamma = gamma
         self.deep_supervision = deep_supervision
+        self.kd_temperature = kd_temperature
 
     def loss_labels_focal(self, outputs, targets, indices, num_boxes):
         assert 'pred_logits' in outputs
@@ -129,12 +131,126 @@ class RTDETRCriterionv2(nn.Module):
         tgt_idx = torch.cat([tgt for (_, tgt) in indices])
         return batch_idx, tgt_idx
 
+    def loss_labels_kd(self, outputs, dn_outputs, targets, indices, dn_meta):
+        """Self-distillation: regular queries learn class distributions
+           from denoising query predictions (soft labels).
+           Denoising queries have known GT labels + box noise; after decoder
+           they produce high-quality soft targets retaining model uncertainty.
+        """
+        device = outputs['pred_logits'].device
+        pred_logits = outputs['pred_logits']          # [bs, nq, num_classes]
+        dn_logits = dn_outputs['pred_logits']         # [bs, ndn, num_classes]
+        dn_positive_idx = dn_meta['dn_positive_idx']
+        dn_num_group = dn_meta['dn_num_group']
+        bs = len(targets)
+
+        kd_loss = torch.tensor(0.0, device=device)
+        count = 0
+
+        for b in range(bs):
+            num_gt = len(targets[b]['labels'])
+            if num_gt == 0 or len(indices[b][0]) == 0:
+                continue
+
+            reg_q_idx, reg_gt_idx = indices[b]
+            dn_q_idx = dn_positive_idx[b]  # [num_gt * dn_num_group]
+
+            if len(dn_q_idx) == 0:
+                continue
+
+            dn_per_gt = dn_q_idx.reshape(num_gt, dn_num_group)  # [num_gt, dn_num_group]
+
+            for q, gt in zip(reg_q_idx, reg_gt_idx):
+                dn_idxs = dn_per_gt[gt]
+
+                with torch.no_grad():
+                    dn_avg = dn_logits[b, dn_idxs].mean(dim=0)
+
+                kd_loss += F.kl_div(
+                    F.log_softmax(pred_logits[b, q] / self.kd_temperature, dim=-1),
+                    F.softmax(dn_avg / self.kd_temperature, dim=-1),
+                    reduction='sum',
+                )
+                count += 1
+
+        if count > 0:
+            kd_loss = kd_loss / count
+
+        return {'loss_kd': kd_loss}
+
+    def loss_group_consistency(self, main_outputs_list, indices_list, targets):
+        """Cross-group consistency for query perturbation.
+
+        For each GT matched by K >= 2 groups, the group with highest IoU
+        to GT serves as anchor (stop_grad). Other groups' predictions
+        are pulled towards the anchor via KL divergence (classification)
+        and L1 loss (box regression).
+        """
+        K = len(main_outputs_list)
+        assert K >= 2
+        device = main_outputs_list[0]['pred_logits'].device
+        bs = len(targets)
+
+        loss_kl = torch.tensor(0.0, device=device)
+        loss_box = torch.tensor(0.0, device=device)
+        count = 0
+
+        for b in range(bs):
+            num_gt = len(targets[b]['labels'])
+            if num_gt == 0:
+                continue
+            gt_boxes_xyxy = box_cxcywh_to_xyxy(targets[b]['boxes'])
+
+            for tgt_j in range(num_gt):
+                gt_box = gt_boxes_xyxy[tgt_j]
+                group_preds = []
+
+                for g in range(K):
+                    src_idx_g, tgt_idx_g = indices_list[g][b]
+                    match = (tgt_idx_g == tgt_j)
+                    if match.sum() == 0:
+                        continue
+                    q = src_idx_g[match][0].item()
+                    logits_g = main_outputs_list[g]['pred_logits'][b, q]
+                    box_g = main_outputs_list[g]['pred_boxes'][b, q]
+
+                    iou, _ = box_iou(
+                        box_cxcywh_to_xyxy(box_g.unsqueeze(0)),
+                        gt_box.unsqueeze(0))
+                    iou_val = iou[0, 0].item()
+                    group_preds.append((logits_g, box_g, iou_val))
+
+                if len(group_preds) < 2:
+                    continue
+
+                # anchor = highest IoU
+                group_preds.sort(key=lambda x: x[2], reverse=True)
+                anchor_logits, anchor_boxes, _ = group_preds[0]
+
+                for logits_q, box_q, _ in group_preds[1:]:
+                    with torch.no_grad():
+                        anchor_dist = F.softmax(anchor_logits, dim=-1)
+                    loss_kl += F.kl_div(
+                        F.log_softmax(logits_q, dim=-1),
+                        anchor_dist,
+                        reduction='sum')
+                    loss_box += F.l1_loss(box_q, anchor_boxes.detach(), reduction='sum')
+                    count += 1
+
+        if count > 0:
+            loss_kl = loss_kl / count
+            loss_box = loss_box / count
+
+        return {'loss_consist_cls': loss_kl, 'loss_consist_box': loss_box}
+
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
         loss_map = {
             'boxes': self.loss_boxes,
             'focal': self.loss_labels_focal,
             'vfl': self.loss_labels_vfl,
         }
+        if loss == 'kd' or loss == 'consistency':
+            return {}  # handled separately in forward
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
 
@@ -160,16 +276,28 @@ class RTDETRCriterionv2(nn.Module):
             losses = {}
             # per-group main loss (last layer)
             main_outputs_list = outputs['query_group_main']
+            matched_indices_list = []
             for g in range(num_groups):
                 g_out = main_outputs_list[g]
                 matched = self.matcher(g_out, targets)
-                indices = matched['indices']
+                indices_g = matched['indices']
+                matched_indices_list.append(indices_g)
                 for loss in self.losses:
-                    meta = self.get_loss_meta_info(loss, g_out, targets, indices)
-                    l_dict = self.get_loss(loss, g_out, targets, indices, num_boxes, **meta)
+                    if loss == 'consistency':
+                        continue  # handled below
+                    meta = self.get_loss_meta_info(loss, g_out, targets, indices_g)
+                    l_dict = self.get_loss(loss, g_out, targets, indices_g, num_boxes, **meta)
                     l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
                     l_dict = {k + '_g{}'.format(g): v for k, v in l_dict.items()}
                     losses.update(l_dict)
+
+            # cross-group consistency: anchor-based alignment among K groups
+            if 'consistency' in self.losses:
+                consist_loss = self.loss_group_consistency(
+                    main_outputs_list, matched_indices_list, targets)
+                for k in consist_loss:
+                    if k in self.weight_dict:
+                        losses[k] = consist_loss[k] * self.weight_dict[k]
 
             # per-group aux loss
             for g in range(num_groups):
@@ -210,15 +338,28 @@ class RTDETRCriterionv2(nn.Module):
 
             if 'dn_aux_outputs' in outputs:
                 assert 'dn_meta' in outputs, ''
-                indices = self.get_cdn_matched_indices(outputs['dn_meta'], targets)
+                indices_dn = self.get_cdn_matched_indices(outputs['dn_meta'], targets)
                 dn_num_boxes = num_boxes * outputs['dn_meta']['dn_num_group']
                 for i, aux_outputs in enumerate(outputs['dn_aux_outputs']):
                     for loss in self.losses:
-                        meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices)
-                        l_dict = self.get_loss(loss, aux_outputs, targets, indices, dn_num_boxes, **meta)
+                        meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices_dn)
+                        l_dict = self.get_loss(loss, aux_outputs, targets, indices_dn, dn_num_boxes, **meta)
                         l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
                         l_dict = {k + f'_dn_{i}': v for k, v in l_dict.items()}
                         losses.update(l_dict)
+
+            # KD per-group: each group independently distills from dn queries
+            if 'dn_meta' in outputs and 'dn_aux_outputs' in outputs and 'kd' in self.losses:
+                for g in range(num_groups):
+                    g_out = main_outputs_list[g]
+                    matched = self.matcher(g_out, targets)
+                    g_indices = matched['indices']
+                    kd_loss = self.loss_labels_kd(
+                        g_out, outputs['dn_aux_outputs'][-1],
+                        targets, g_indices, outputs['dn_meta'])
+                    kd_loss = {k + '_g{}'.format(g): kd_loss[k] * self.weight_dict.get('loss_kd', 1.0)
+                               for k in kd_loss if k in self.weight_dict}
+                    losses.update(kd_loss)
 
             return losses
 

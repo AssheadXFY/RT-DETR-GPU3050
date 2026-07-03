@@ -1,0 +1,278 @@
+======================================================================
+  对话交接文档 — 新对话直接读这个
+  日期: 2026-07-01 (更新于当日晚间)
+======================================================================
+
+----------------------------------------------------------------------
+1. 项目背景
+----------------------------------------------------------------------
+任务: RT-DETRv2-S (R18, 20M) COCO 2017 目标检测改进
+目标: 在复现的 baseline 47.74% 基础上，用方法论找到有效涨点方向
+论文叙事: "轻量 attention / 训练策略 改进 DETR neck"，三行 table:
+  行1: RT-DETRv2-S official weights = 48.1% (验证 eval pipeline)
+  行2: RT-DETRv2-S our reproduction = 47.74%
+  行3: RT-DETRv2-S + Ours = X%
+
+创新点验证框架: 烟雾测试 — epoch 0 冷启动 mAP > baseline 14.4% 即通过
+  注意: 此框架对架构改动有效，对训练策略/数据增强改动无效（需多epoch验证）
+
+----------------------------------------------------------------------
+2. 服务器
+----------------------------------------------------------------------
+
+服务器1 (container-778a4ea2cd-343930bd):
+  GPU: RTX 3090 × 1
+  代码路径: /root/autodl-tmp/RT-DETR-GPU3050/rtdetrv2_pytorch
+  COCO: /root/autodl-tmp/RT-DETR-GPU3050/rtdetrv2_pytorch/dataset/coco/
+  预训练权重: /root/.cache/torch/hub/checkpoints/ResNet18_vd_pretrained_from_paddle.pth
+  GitHub: https://github.com/AssheadXFY/RT-DETR-GPU3050 (分支: RH)
+  磁盘: 50G, 需定期清理 output checkpoint
+  暂停状态:
+    J+L (smoke_jl): epoch 0 已完成, epoch 1 被 pkill 中断(step ~1700/7392)
+      last.pth 指向 epoch 0
+      loss_kd 正常产生(~0.02), KD loss 机制验证通过
+      恢复命令: -c queryperturb_kd.yml -r output/.../last.pth -u epoches=2
+
+服务器2 (container-a574409304-809bcb22):
+  GPU: RTX 3090 × 1
+  代码路径: /root/autodl-tmp/RT-DETR-XFY/rtdetrv2_pytorch
+  COCO: /root/autodl-tmp/RT-DETR-XFY/rtdetrv2_pytorch/dataset/coco/
+  预训练权重: /root/.cache/torch/hub/checkpoints/ResNet18_vd_pretrained_from_paddle.pth
+  GitHub: https://github.com/AssheadXFY/RT-DETR-XFY (分支: RH)
+  暂停状态:
+    J (smoke_queryperturb_s2): epoch 0-2 已完成, epoch 3 被 pkill 中断(step ~2700/7392)
+      last.pth 指向 epoch 2
+      epoch 0: 15.43%   epoch 1: 24.84% (等待 epoch 2 mAP)
+      恢复命令: -c queryperturb.yml -r output/.../last.pth -u epoches=10
+
+启动命令模板（必须加 pretrained 绕过 torch.hub 下载）:
+  cd /root/autodl-tmp/RT-DETR-GPU3050/rtdetrv2_pytorch
+  nohup python tools/train.py -c configs/rtdetrv2/rtdetrv2_r18vd_120e_coco.yml \
+    -u KEY=VALUE \
+    -u PResNet.pretrained=/root/.cache/torch/hub/checkpoints/ResNet18_vd_pretrained_from_paddle.pth \
+    -u epoches=N \
+    --use-amp > /root/autodl-tmp/smoke_XXX.log 2>&1 &
+
+日志用 grep 快速出结果:
+  grep -A5 "coco_eval_bbox\|Accumulating\|IoU metric\|best_stat" logfile | tail -20
+
+----------------------------------------------------------------------
+3. 全部实验 & 结果汇总
+----------------------------------------------------------------------
+
+baseline 数据 (对比基准):
+  train_baseline_72.log: from scratch, 72 epoch, MultiStepLR, seed=0, val_bs=16, use_amp=True
+    epoch 0 = 14.40%   epoch 1 = 24.07%   epoch 2 = 27.37%
+    最终 epoch 71 best = 46.73%
+  train_baseline_120e.log: resume from epoch 72, 72→120, use_amp=False, val_bs=32
+    最终 epoch 117 best = 47.74% (our reproduction)
+  注意: baseline 72 是第一段（from scratch），120e 是续训。两段合起来是一次完整训练。
+
+--- 方案A - Neck Attention (策略: 换地盘) ---
+  ECA  (epoch 0 mAP = 13.7%, 失败, -0.7)
+  SimAM (epoch 0 mAP = 13.8%, 失败, -0.6)
+  EMA  (未测, 放弃)
+  结论: DETR neck 的 CSP bottleneck (0.5× expansion) 扼杀了输出后插入的 attention
+
+--- 方案H - FPN 空间偏置 (策略: 缝合, 8400参数) ---
+  epoch 0 mAP = 14.3%, 失败 (-0.1)
+  结论: 与方案A同一类问题——neck 外部插入被 CSP bottleneck 压缩
+
+--- 方案I - Decoder 逐层深监督 (策略: 改训练) ---
+  epoch 0 mAP = 14.4%, 持平
+  结论: 方向性错误。RT-DETR 本来就每层有 aux loss (weight=1.0)，方案I 只是把浅层砍到 0.3/0.6
+  ⚠ 教训: 看到 aux loss 就先入为主当成新机制，没检查 baseline 已有同样结构
+
+--- 方案C - 余弦退火 LR (策略: 改训练) ---
+  epoch 0 mAP = 13.90% (vs baseline 14.40%, -0.50)
+  结论: epoch 0 的 LR 由 warmup 控制，cosine 还没发挥作用。与方案F 同样的问题——烟雾测试测不了训练策略改进
+  实现: CosineAnnealingLR 已在框架注册，只需 YAML 配置。用 optimizer_cosine.yml 替代 optimizer.yml 避免 milestones 泄漏
+
+--- 方案F - Curriculum Denoising (策略: 改训练) ---
+  epoch 0 = 14.68% (+0.28)  ← 通过烟雾测试
+  epoch 1 = 23.90% (-0.17 vs baseline 24.07%)
+  epoch 2 = 27.24% (-0.13 vs baseline 27.37%)
+  调度: label_noise 1.6x→0.4x, box_noise 1.5x→0.5x, 线性100epoch衰减
+  结论: 差距在缩小但始终落后。两个可能原因:
+    a) 噪声调度太激进（文档原设计是 0.8→0.2，实现却是 1.6→0.4）
+    b) 烟雾测试覆盖阶段全在大噪声区间（epoch 0-10），优势在后期
+  状态: 已终止（epoch 3），等待方法级重评估
+  Novelty: DETR家族首次 epoch 级噪声衰减（查重已确认）
+
+--- 方案J - Query Perturbation (策略: 基于 RT-DETRv3 的 O2M 密集监督, 进行中) ---
+  epoch 0 训练中（预计 ~40min）
+  原理: topk 选出的 300 query 复制成 K=2 组，content 加高斯 noise (σ=0.1)，
+        600 query 进同一个 decoder，每组独立做 Hungarian match，
+        每个 GT 可匹配 2 个 query（vs baseline 1 个），监督信号密度翻倍
+  改动: rtdetrv2_decoder.py (forward 复制+噪声+attn_mask 扩展)
+        rtdetrv2_criterion.py (multi-group loss 路径)
+  推理代价: 零（平均两组预测）
+  灵感来源: CVPR 24 MS-DETR / WACV 25 RT-DETRv3 / CVPR 25 DEIM
+  日志: /root/autodl-tmp/smoke_queryperturb.log
+  配置: rtdetrv2_r18vd_120e_coco_queryperturb.yml
+
+----------------------------------------------------------------------
+4. 已修改的源码文件
+----------------------------------------------------------------------
+
+(1) src/zoo/rtdetr/hybrid_encoder.py
+    新增参数: attn_type=None, spatial_bias=False
+    新增代码: 7个 attention 插入点 + 3个空间偏置参数
+
+(2) src/nn/backbone/attn_modules.py (新建)
+    EMA, SimAM, ECA 三个模块 + create_attn_module 工厂函数
+
+(3) src/zoo/rtdetr/rtdetrv2_decoder.py
+    新增参数: curriculum_denoising=False, num_query_groups=1, query_group_noise=0.1
+    新增方法: set_epoch(), _get_curriculum_noise()
+    新增逻辑: multi-group query 复制 + content noise + attn_mask 扩展
+
+(4) src/solver/det_engine.py
+    train_one_epoch 开头加了 decoder.set_epoch(epoch) 调用
+
+(5) src/zoo/rtdetr/rtdetrv2_criterion.py
+    新增参数: deep_supervision=False
+    新增逻辑: multi-group loss 路径（每组独立 Hungarian match + loss 平均）
+    在 aux_outputs 循环中加了按层加权逻辑: layer_weight = min(1.0, 0.3 * (i + 1))
+
+(6) config 文件:
+    已创建:
+    - rtdetrv2_r18vd_120e_coco_eca.yml
+    - rtdetrv2_r18vd_120e_coco_simam.yml
+    - rtdetrv2_r18vd_120e_coco_ema.yml
+    - rtdetrv2_r18vd_120e_coco_curriculum.yml
+    - rtdetrv2_r18vd_120e_coco_spatialbias.yml
+    - rtdetrv2_r18vd_120e_coco_cosine.yml
+    - rtdetrv2_r18vd_120e_coco_queryperturb.yml
+    新建 include 文件:
+    - include/optimizer_cosine.yml (CosineAnnealingLR 专用，替代 optimizer.yml)
+
+----------------------------------------------------------------------
+5. 完整方案列表 & 当前优先级
+----------------------------------------------------------------------
+
+=== 第一梯队：进行中 ===
+  J - Query Perturbation (基于 RT-DETRv3 WACV 25, 进行中)
+    原理: topk 300 query 复制×2 + content 高斯噪声, 每 GT 匹配 2 query
+    状态: 服务器1 epoch 0 训练中
+
+=== 第二梯队：J 的升级变体（改动小，直接叠加） ===
+  J2 - 频域扰动替代高斯噪声
+    来源: Self-Bootstrapping (ICML 2025) — Fourier 域扰动保留空间结构
+    原理: FFT→只扰动高频分量，保留低频语义，每组 query 对空间敏感但共享类别身份
+    改动: ~10行 (改噪声生成逻辑)
+
+  J3 - K=3/4 更多查询组
+    来源: RT-DETRv3
+    原理: 增加 query 组数看密集监督上限
+    改动: YAML 一行
+
+=== 第三梯队：方案J 的协同方案（正交，可组合） ===
+  K - Query De-duplication
+    来源: ToMe (ICLR 2023 Oral) — Token Merging for ViT
+    原理: decoder 层间合并 IoU>0.9 的重复 query，释放 attention capacity
+    改动: ~20行 (改 TransformerDecoder.forward)
+
+  L - 去噪自蒸馏 (Denoising Self-Distillation) [原创]
+    原理: KL loss — 常规 query 模仿同类别 denoising query 的预测分布
+          denoising query 的预测是高质量软标签（接近 GT 但保留 decoder 不确定性）
+    代价: ~15行 (改 criterion)
+
+  M - Laplace 噪声调度（方案F 的升级版）
+    来源: Improved Noise Schedule for Diffusion Training (ICCV 2025)
+    原理: log-SNR 空间 Laplace 分布替代线性衰减，大部分时间用中等噪声
+    代价: ~5行 (改 _get_curriculum_noise)
+
+  N - 解耦 Label/Box 噪声衰减
+    来源: DAPS (CVPR 2025 Oral) — Decoupled Noise Annealing
+    原理: label noise 快衰减(20 epoch→0.1), box noise 慢衰减(100 epoch→0.3)
+          语义混淆早消除，空间偏移慢衰减提升定位鲁棒
+    代价: ~5行 (改 _get_curriculum_noise 加双参数)
+
+=== 第四梯队：独立方案（不依赖 J） ===
+  B  - AIFI 多尺度 (文档 8.2, 未编码)
+  C  - Cosine LR 完整120 epoch (文档 8.3, 已配置)
+  D  - VisDrone 小目标迁移 (文档 8.4, 需下载数据集)
+
+=== 已否决（不再考虑） ===
+  A   - ECA/SimAM/EMA in neck: CSP bottleneck 扼杀外部插入
+  E   - Encoder→Decoder 直连: 单尺度 skip 接不进多尺度 cross-attn
+  F   - Curriculum Denoising (当前版本): 噪声调度过激+烟雾测不到后期
+  H   - FPN 空间偏置: 同 A
+  I   - 深监督: 方向性错误，削弱已有信号
+  11.1 - CSP 内部 attn: 瓶颈问题本质不变
+  11.2 - FPN concat LN: BS=16 下 BN 不稳定
+
+----------------------------------------------------------------------
+6. 顶会前沿调研
+----------------------------------------------------------------------
+
+=== DETR 方向 ===
+  MS-DETR (CVPR 2024): decoder cross-attn 后加 O2M aux head，训后丢弃，+3.7 AP @ 12 epoch
+  RT-DETRv3 (WACV 2025 Oral): CNN aux head + query 扰动 + O2M decoder，R18→48.1%
+  DEIM (CVPR 2025): Dense O2O + Matchability-Aware Loss，训时减半，RT-DETRv2 +1.3 AP
+  共同点: 训练时加密集监督，推理时零开销
+
+=== 跨领域可缝合技术 ===
+  ToMe (ICLR 2023 Oral): token 相似度合并→释放 attention capacity
+  Improved Noise Schedule (ICCV 2025): Laplace 分布在 log-SNR 空间显著优于余弦/线性
+  DAPS (CVPR 2025 Oral): 解耦噪声退火→不同维度的噪声独立控制
+  Self-Bootstrapping (ICML 2025): 频域扰动保留空间结构的自适应方法
+
+=== 行动路径 ===
+  方案J epoch 0 结果
+      ├─ 通过 → J + J2/J3 (加码) + K/L (并行组合)
+      └─ 失败 → K + L (换方向，query 质量+监督密度同时改)
+
+  所有新方案设计约束: 可小幅度改架构（≤5000参数），少量 epoch（≤3）可验证，推理尽量零开销
+
+----------------------------------------------------------------------
+7. 关键配置细节
+----------------------------------------------------------------------
+- batch_size=16, 640×640, epoches=120(完整训练), use_amp=True, use_ema=True
+- MultiStepLR: milestones=[1000], warmup=2000 steps
+- 预训练: PResNet18, pretrained=True 会走 torch.hub, 必须用本地文件覆盖
+- 数据增强: epoch 117 停止 photometric+zoomout+IoUcrop
+- 损失: VFL + bbox L1 + GIoU
+
+----------------------------------------------------------------------
+8. CLAUDE.md 中的反省（避免重复犯错）
+----------------------------------------------------------------------
+2016-07-01 方案I 误判:
+  看到 aux loss 就触发"训练策略需要多epoch"模板，没检查 baseline 已有同样 aux loss。
+  方案I 只是把已有信号砍半（1.0→0.3），不是新机制。方向性错误，不应建议继续。
+
+规则:
+  - epoch 0 持平 baseline 时，先检查改动能不能从原理上解释为什么有效
+  - loss 系数调整 ≠ 引入新机制，epoch 0 就能判断
+  - 用户质疑时先检查自己的推理链，不要急于辩护
+
+----------------------------------------------------------------------
+9. 学术叙事方向（从实验事实出发）
+----------------------------------------------------------------------
+经过 6 轮实验 + 顶会调研，叙事方向应当：
+
+新角度: "Revisiting Supervision Density in Lightweight DETR Training"
+  问题: RT-DETR one-to-one Hungarian matching 只给每个 GT 分 1 个正样本，
+        300 query 中大量负样本浪费了监督信号。小 backbone (R18) 对这个影响更敏感。
+  解: 在 query 生成时引入多样性（扰动/复制→多组独立匹配），
+      训练时每个 GT 获得 K 个正样本的密集监督，推理时零开销。
+  对比: 不堆模块、不改 backbone/neck——纯训练策略改进。
+
+相关论文:
+  RT-DETR (CVPR 2024) / RT-DETRv2 (arXiv 2024)
+  RT-DETRv3 (WACV 2025 Oral): Hierarchical Dense Positive Supervision
+  MS-DETR (CVPR 2024): Mixed Supervision
+  DEIM (CVPR 2025): Dense O2O + MAL
+  DN-DETR (CVPR 2022) / DINO (ICLR 2023)
+
+----------------------------------------------------------------------
+10. 文档说明
+----------------------------------------------------------------------
+项目技术文档_v2.txt: 完整的理论框架、方法论、12个方案的设计描述
+CLAUDE.md: 对话中的错误反思 + 规则
+对话交接_2026-07-01.txt (本文件): 当前状态全貌, 给新对话直接读
+train_baseline_72.log: baseline 从零训练 72 epoch 完整日志
+train_baseline_120e.log: baseline resume 72→120 epoch 日志
+smoke_*.log: 各方案烟雾测试日志
+======================================================================

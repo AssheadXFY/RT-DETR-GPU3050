@@ -67,7 +67,7 @@ class BasicBlock(nn.Module):
 
         self.branch2a = ConvNormLayer(ch_in, ch_out, 3, stride, act=act)
         self.branch2b = ConvNormLayer(ch_out, ch_out, 3, 1, act=None)
-        self.act = nn.Identity() if act is None else get_activation(act) 
+        self.act = nn.Identity() if act is None else get_activation(act)
 
 
     def forward(self, x):
@@ -77,7 +77,7 @@ class BasicBlock(nn.Module):
             short = x
         else:
             short = self.short(x)
-        
+
         out = out + short
         out = self.act(out)
 
@@ -137,9 +137,9 @@ class Blocks(nn.Module):
         for i in range(count):
             self.blocks.append(
                 block(
-                    ch_in, 
+                    ch_in,
                     ch_out,
-                    stride=2 if i == 0 and stage_num != 2 else 1, 
+                    stride=2 if i == 0 and stage_num != 2 else 1,
                     shortcut=False if i == 0 else True,
                     variant=variant,
                     act=act)
@@ -164,8 +164,8 @@ class PResNet(nn.Module):
         num_stages=4, 
         return_idx=[0, 1, 2, 3], 
         act='relu',
-        freeze_at=-1, 
-        freeze_norm=True, 
+        freeze_at=-1,
+        freeze_norm=True,
         pretrained=False):
         super().__init__()
 

@@ -191,6 +191,66 @@ class TransformerEncoder(nn.Module):
         return output
 
 
+class ISFEBlock(nn.Module):
+    """Intra-Scale Feature Enhancement: lightweight conv residual.
+
+    Compensates feature levels not receiving transformer attention.
+    Input/Output: [B, C, H, W].
+    """
+    def __init__(self, channels, expansion=2, act='gelu'):
+        super().__init__()
+        hidden = int(channels * expansion)
+        self.expand = nn.Conv2d(channels, hidden, kernel_size=1, bias=False)
+        self.dwconv = nn.Conv2d(hidden, hidden, kernel_size=3, padding=1,
+                                 groups=hidden, bias=False)
+        self.squeeze = nn.Conv2d(hidden, channels, kernel_size=1, bias=False)
+        self.norm = nn.BatchNorm2d(channels)
+        self.act = get_activation(act)
+
+    def forward(self, x):
+        residual = x
+        out = self.expand(x)
+        out = self.dwconv(out)
+        out = self.act(out)
+        out = self.squeeze(out)
+        return self.act(self.norm(out + residual))
+
+
+class CSCGBlock(nn.Module):
+    """Cross-Scale Context Gate: channel-wise gate that selectively propagates
+    global context from a higher feature level (C5) into a local level (C3/C4).
+
+    Gate is computed from channel statistics of both levels; avoids pixel-wise
+    spatial misalignment issues at large upsampling ratios.
+    """
+    def __init__(self, channels, reduction=4):
+        super().__init__()
+        self.proj_ctx = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+        )
+        self.gate = nn.Sequential(
+            nn.Linear(channels * 2, channels // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x_local, x_global):
+        # x_local:  [B, C, H, W]  — C3 or C4
+        # x_global: [B, C, h, w]  — C5 (transformer-enhanced)
+        proj_ctx = self.proj_ctx(x_global)
+
+        s_local = x_local.mean(dim=[2, 3])    # [B, C]
+        s_globl = proj_ctx.mean(dim=[2, 3])   # [B, C]
+        g = self.gate(torch.cat([s_local, s_globl], dim=-1))  # [B, C]
+        g = g.unsqueeze(-1).unsqueeze(-1)                     # [B, C, 1, 1]
+
+        ctx_up = F.interpolate(proj_ctx, size=x_local.shape[-2:],
+                                mode='bilinear', align_corners=False)
+        return x_local + g * ctx_up
+
+
 @register()
 class HybridEncoder(nn.Module):
     __share__ = ['eval_spatial_size', ]
@@ -213,7 +273,9 @@ class HybridEncoder(nn.Module):
                  version='v2',
                  fpn_block_type='csp',
                  attn_type=None,
-                 spatial_bias=False):
+                 spatial_bias=False,
+                 isfe_enabled=False,
+                 cscg_enabled=False):
         super().__init__()
         self.in_channels = in_channels
         self.feat_strides = feat_strides
@@ -299,6 +361,25 @@ class HybridEncoder(nn.Module):
                 for i in range(num_scales)
             ])
 
+        # ISFE: enhance feature levels not receiving transformer attention
+        self.isfe_enabled = isfe_enabled
+        if isfe_enabled:
+            enc_indices = set(use_encoder_idx)
+            self.isfe_blocks = nn.ModuleList([
+                ISFEBlock(hidden_dim) if i not in enc_indices else nn.Identity()
+                for i in range(num_scales)
+            ])
+
+        # CSCG: cross-scale context propagation from C5 to lower levels
+        self.cscg_enabled = cscg_enabled
+        if cscg_enabled:
+            # C5 index = last feat_strides entry (idx 2 for 3-scale)
+            c5_idx = len(in_channels) - 1
+            self.cscg_blocks = nn.ModuleList([
+                CSCGBlock(hidden_dim) if i != c5_idx else nn.Identity()
+                for i in range(num_scales)
+            ])
+
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -350,6 +431,17 @@ class HybridEncoder(nn.Module):
 
         # plug-and-play: attention after projection
         proj_feats = [self.input_attns[i](f) for i, f in enumerate(proj_feats)]
+
+        # ISFE: intra-scale enhancement for levels without transformer attention
+        if self.isfe_enabled:
+            proj_feats = [self.isfe_blocks[i](f) for i, f in enumerate(proj_feats)]
+
+        # CSCG: cross-scale context from C5 to C3/C4
+        if self.cscg_enabled:
+            c5_idx = len(self.in_channels) - 1
+            c5_feat = proj_feats[c5_idx]  # C5 already has transformer context
+            for i in range(c5_idx):
+                proj_feats[i] = self.cscg_blocks[i](proj_feats[i], c5_feat)
 
         # broadcasting and fusion
         inner_outs = [proj_feats[-1]]

@@ -313,7 +313,9 @@ class RTDETRTransformerv2(nn.Module):
                  query_select_method='default',
                  curriculum_denoising=False,
                  num_query_groups=1,
-                 query_group_noise=0.1):
+                 query_group_noise=0.1,
+                 query_group_noise_type='gaussian',
+                 encoder_beacon=0.0):
         super().__init__()
         assert len(feat_channels) <= num_levels
         assert len(feat_strides) == len(feat_channels)
@@ -353,6 +355,8 @@ class RTDETRTransformerv2(nn.Module):
         self.current_epoch = 0  # updated by engine before each epoch
         self.num_query_groups = num_query_groups
         self.query_group_noise = query_group_noise
+        self.query_group_noise_type = query_group_noise_type
+        self.encoder_beacon = encoder_beacon
         if num_denoising > 0: 
             self.denoising_class_embed = nn.Embedding(num_classes+1, hidden_dim, padding_idx=num_classes)
             init.normal_(self.denoising_class_embed.weight[:-1])
@@ -576,6 +580,24 @@ class RTDETRTransformerv2(nn.Module):
         # input projection and embedding
         memory, spatial_shapes = self._get_encoder_input(feats)
 
+        # encoder beacon: slight amplification at GT positions (training only)
+        if self.training and self.encoder_beacon > 0 and targets is not None:
+            bs = memory.shape[0]
+            acc = 0
+            for lvl in range(len(spatial_shapes)):
+                h, w = int(spatial_shapes[lvl][0]), int(spatial_shapes[lvl][1])
+                for b in range(bs):
+                    tgt = targets[b]
+                    if len(tgt.get('boxes', [])) == 0:
+                        continue
+                    cx = tgt['boxes'][:, 0]
+                    cy = tgt['boxes'][:, 1]
+                    gx = (cx * w).long().clamp(0, w - 1)
+                    gy = (cy * h).long().clamp(0, h - 1)
+                    fidx = (gy * w + gx) + acc
+                    memory[b, fidx] = memory[b, fidx] * (1.0 + self.encoder_beacon)
+                acc += h * w
+
         # prepare denoising training
         if self.training and self.num_denoising > 0:
             label_noise = self._get_curriculum_noise(self.label_noise_ratio)
@@ -611,8 +633,20 @@ class RTDETRTransformerv2(nn.Module):
 
             bs, nq, d = reg_content.shape
             K = self.num_query_groups
-            noise = torch.randn(bs, nq * K, d, device=reg_content.device) * self.query_group_noise
-            content_multi = reg_content.repeat(1, K, 1) + noise
+            content_multi = reg_content.repeat(1, K, 1)  # [bs, nq*K, d]
+            if self.query_group_noise_type == 'fourier':
+                # Fourier-domain perturbation: add noise only to high-frequency
+                # components, preserving low-frequency semantics across groups
+                x = content_multi.transpose(0, 1)  # [nq*K, bs, d]
+                x_fft = torch.fft.rfft(x.float(), dim=-1)  # [nq*K, bs, d//2+1]
+                half = x_fft.shape[-1] // 2
+                noise_fft = torch.randn_like(x_fft[:, :, half:]) * self.query_group_noise
+                x_fft[:, :, half:] = x_fft[:, :, half:] + noise_fft
+                content_multi = torch.fft.irfft(x_fft, n=d, dim=-1).transpose(0, 1).to(reg_content.dtype)
+            else:
+                # Gaussian: unstructured isotropic noise
+                noise = torch.randn(bs, nq * K, d, device=reg_content.device) * self.query_group_noise
+                content_multi = content_multi + noise
             bbox_multi = reg_bbox.repeat(1, K, 1)
 
             if dn_meta is not None:
