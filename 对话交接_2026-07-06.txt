@@ -1,0 +1,175 @@
+======================================================================
+  对话交接文档 — 新对话直接读这个
+  日期: 2026-07-06
+  基于: 对话交接_2026-07-01.txt（历史方案/调研/服务器详情）
+        对话交接_2026-07-02.txt（07-02 进展）
+        对话交接_2026-07-03.txt（07-03 进展，方案筛选/代码/方法论）
+======================================================================
+
+----------------------------------------------------------------------
+1. 当前实验状态
+----------------------------------------------------------------------
+
+S2: J+ISFE 120 epoch 训练中 (train_j_isfe_120e.log)
+  容器: container-d7834d8003-62d575e8 (新实例)
+  checkpoint_freq=10, disk 36G/50G (15G 可用)
+  启动: 2026-07-06 10:55
+
+S1: 空闲
+
+本地已下载:
+  rtdetrv2_r18vd_120e_coco/          — baseline (72+48 epoch 复现)
+  rtdetrv2_r18vd_120e_coco_queryperturb/ — J-only epoch 0-9
+  rtdetrv2_r18vd_120e_coco_isfe/     — J+ISFE epoch 0-1 smoke test
+
+----------------------------------------------------------------------
+2. 全部实验结果（更新至 07-06）
+----------------------------------------------------------------------
+
+=== 最终消融表 ===
+
+| Config | Epoch 0 | Epoch 1 | Epoch 2 | 判决 |
+|--------|---------|---------|---------|------|
+| Baseline | 14.40% | 24.07% | 27.37% | 基准 |
+| ISFE-only | 13.05% | 22.99% | 26.67% | 单独有害 |
+| J-only | 15.43% | 24.84% | 28.19% | 有效 |
+| J+ISFE | 15.58% | 24.95% | — | 有效，synergy |
+| J+L (KD) | 14.56% | — | — | 死 |
+| J+Consistency | 15.70% | 24.80% | 28.21% | 死(持平J) |
+| CSCG+J | 14.37% | 23.36% | 26.44% | 死 |
+
+J+ISFE 是唯一通过 smoke test 且持续正 delta 的组合。
+关键消融: ISFE 单独 = -1.35%, J+ISFE = +1.18% vs baseline — 真正的 synergy。
+
+----------------------------------------------------------------------
+3. 论文框架：双端协同（07-06 确立定位）
+----------------------------------------------------------------------
+
+叙事: "轻量 DETR 的 encoder 和 decoder 存在不对称瓶颈"
+
+  Decoder 侧 — J (Query Perturbation)
+    解决: O2O matching 监督稀疏
+    来源: RT-DETRv3 的 Query Perturbation 组件，剥离后适配到 RT-DETRv2
+    机制: 300 query × K=2 groups + Gaussian noise → 每 GT 匹配 2 query
+
+  Encoder 侧 — ISFE (Intra-Scale Feature Enhancement)
+    解决: C3/C4 没有 transformer attention，特征容量不足
+    机制: inverted bottleneck + DWConv，在 projection 后、FPN 前增强 C3/C4
+
+  差异化: 没有已发表论文同时改 encoder 和 decoder 两端:
+    - Lite DETR: 只改 encoder (降 C3/C4 更新频率)
+    - D²ETR: 只改 encoder (C3/C4 只用 conv)
+    - HA-DETR: 只改 decoder (self-attn → conv)
+    - 我们: encoder(ISFE) + decoder(J) 双端协同
+
+三行 table:
+  行1: RT-DETRv2-S official = 48.1%
+  行2: RT-DETRv2-S our reproduction = 47.74%
+  行3: RT-DETRv2-S + Ours (J+ISFE) = X%  ← S2 正在跑
+
+----------------------------------------------------------------------
+4. 顶会调研 — 2026-07-06 更新
+----------------------------------------------------------------------
+
+=== 直接相关：同问题空间的论文 ===
+
+D²ETR (Decoupled DETR) — ICASSP 2025
+  核心思想: "只对 C5 做 self-attention，C3/C4 用 conv 做跨层融合"
+  与 ISFE 看到相同问题，但解法不同: D²ETR 跳过 C3/C4 的增强，ISFE 给了 conv 补偿
+
+HA-DETR — Nature Scientific Reports 2026
+  R18 backbone, 替换 decoder self-attn 为 conv SIM, 48.4 AP @ 68 FPS
+  和我们是 R18 上的直接对标
+
+Lite DETR — CVPR 2023 (持续被引用至 2025)
+  C3/C4 高频特征用更低频率更新 → encoder GFLOPs -60%
+  看到同样问题，但解法是"少更新"而非"换方式处理"
+
+=== 可缝合的模块来源 ===
+
+F-DETR — Applied Soft Computing 2025
+  首次把多尺度特征引入 Decoder，encoder 只处理单尺度 C5
+  可缝合点: encoder 只处理 C5 + decoder 多尺度消费 → J+ISFE 的升级方向
+
+NeXt-DETR — Information Sciences 2026
+  ConvNeXt-v2 backbone + FuNeXt encoder (大核 DWConv)
+  可缝合点: 7×7 DWConv 替换 ISFE 的 3×3 DWConv
+
+SO-DETR — IJCNN 2025
+  双域混合编码器 (空间+频域)，VisDrone 小目标
+  可缝合点: 在 ISFE 内嵌频域分支 (spatial features → FFT valid here)
+
+=== 对比矩阵 ===
+
+| 论文 | Encoder 改动 | Decoder 改动 | Backbone |
+|------|:---:|:---:|------|
+| Lite DETR | 降 C3/C4 频率 | — | R50 |
+| D²ETR | C3/C4 → conv | — | R50 |
+| HA-DETR | — | self-attn→conv | R18 |
+| F-DETR | 单尺度 C5 | 多尺度融合 | R50 |
+| **我们** | **ISFE (conv补偿)** | **J (query扰动)** | **R18** |
+
+双端协同是我们最大的差异化。
+
+----------------------------------------------------------------------
+5. 论文方法论（来自用户，07-03 确立）
+----------------------------------------------------------------------
+
+1. 复现 baseline: 找最新的开源顶会论文，跑通代码，复现结果
+2. 理解模块: 拆解每个模块的作用
+3. 找可替换模块: 在同期其他顶会论文中找功能相似的模块，直接替换（缝合）
+4. 写论文隐藏替换操作: 写作框架是"分析领域问题 → 提出想法"，不是"我们换了 X 为 Y"
+5. 领域适配: 如果能对模块做适配，故事更完整
+
+关键原则: 单个已有模块不算创新。多个模块的缝合组合 + 协同机制 + RT-DETR 缺口
+的设计理由 = 可以。
+
+----------------------------------------------------------------------
+6. 服务器信息
+----------------------------------------------------------------------
+
+S2 (container-d7834d8003-62d575e8):
+  GPU: RTX 3090 × 1
+  代码路径: /root/autodl-tmp/RT-DETR-XFY/rtdetrv2_pytorch
+  GitHub: https://github.com/AssheadXFY/RT-DETR-XFY (分支: RH)
+  预训练权重: /root/.cache/torch/hub/checkpoints/ResNet18_vd_pretrained_from_paddle.pth
+  运行中: J+ISFE 120 epoch (train_j_isfe_120e.log)
+  磁盘: 36G/50G, 15G 可用
+
+S1: 空闲 (原 container-778a4ea2cd-343930bd, 可能已变更)
+  代码路径: /root/autodl-tmp/RT-DETR-GPU3050/rtdetrv2_pytorch
+  GitHub: https://github.com/AssheadXFY/RT-DETR-GPU3050 (分支: RH)
+
+启动命令模板:
+  cd /root/autodl-tmp/<repo>/rtdetrv2_pytorch
+  nohup python tools/train.py -c configs/rtdetrv2/<config>.yml \
+    -u PResNet.pretrained=/root/.cache/torch/hub/checkpoints/ResNet18_vd_pretrained_from_paddle.pth \
+    -u epoches=N --use-amp > /root/autodl-tmp/<logfile>.log 2>&1 &
+
+日志查看:
+  grep -A5 "coco_eval_bbox\|Accumulating\|IoU metric\|best_stat" logfile | tail -20
+
+----------------------------------------------------------------------
+7. 关键文件索引
+----------------------------------------------------------------------
+
+源码 (已修改):
+  src/zoo/rtdetr/hybrid_encoder.py   — ISFEBlock, CSCGBlock
+  src/zoo/rtdetr/rtdetrv2_decoder.py — J (num_query_groups, query_group_noise)
+  src/zoo/rtdetr/rtdetrv2_criterion.py — multi-group loss + KD + consistency
+
+配置文件:
+  rtdetrv2_r18vd_120e_coco_queryperturb.yml       — J only
+  rtdetrv2_r18vd_120e_coco_isfe.yml                — J+ISFE (S2 正在跑)
+  rtdetrv2_r18vd_120e_coco_isfe_only.yml           — ISFE only (no J)
+  rtdetrv2_r18vd_120e_coco_cscg.yml                — J+CSCG
+  rtdetrv2_r18vd_120e_coco_queryperturb_kd.yml     — J+L (废弃)
+  rtdetrv2_r18vd_120e_coco_queryperturb_consist.yml — J+Consistency (废弃)
+  rtdetrv2_r18vd_120e_coco_queryperturb_fourier.yml — J+J2 (废弃)
+
+参考文档:
+  对话交接_2026-07-01.txt — 历史方案/代码/调研
+  对话交接_2026-07-03.txt — 07-03 进展
+  CLAUDE.md               — 六问 + 方法论 + 错误记录
+
+======================================================================
