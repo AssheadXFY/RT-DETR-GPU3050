@@ -7,7 +7,7 @@ __include__: [
 ]
 
 
-output_dir: ./output/rtdetrv2_r18vd_120e_coco_queryperturb
+output_dir: ./output/rtdetrv2_r18vd_120e_coco_saca
 
 
 PResNet:
@@ -25,8 +25,7 @@ HybridEncoder:
 
 RTDETRTransformerv2:
   num_layers: 3
-  num_query_groups: 2
-  query_group_noise: 0.1
+  use_cross_level_weight: True
 
 
 epoches: 120

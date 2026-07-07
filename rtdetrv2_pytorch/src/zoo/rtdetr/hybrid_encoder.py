@@ -16,6 +16,49 @@ from ...core import register
 __all__ = ['HybridEncoder']
 
 
+class CCFMBlock(nn.Module):
+    """Cross-scale Context Fusion Module.
+
+    Replaces CSPRepLayer in FPN/PAN fusion. Uses a single-path design
+    with large-kernel depthwise conv + channel attention to avoid the
+    CSP bottleneck (expansion < 1.0) that suppresses encoder enhancements.
+
+    Input: [B, 2*C, H, W]  (concat of high-level and low-level features)
+    Output: [B, C, H, W]
+    """
+    def __init__(self, c_in, c_out, reduction=4, act='silu'):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Conv2d(c_in, c_out, kernel_size=1, bias=False),
+            nn.BatchNorm2d(c_out),
+        )
+        self.dwconv = nn.Conv2d(c_out, c_out, kernel_size=7, padding=3,
+                                 groups=c_out, bias=False)
+        self.norm1 = nn.BatchNorm2d(c_out)
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c_out, c_out // reduction, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c_out // reduction, c_out, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        self.proj_out = nn.Sequential(
+            nn.Conv2d(c_out, c_out, kernel_size=1, bias=False),
+            nn.BatchNorm2d(c_out),
+        )
+        self.act = get_activation(act)
+
+    def forward(self, x):
+        out = self.proj(x)
+        identity = out
+        out = self.dwconv(out)
+        out = self.norm1(out)
+        out = out * self.se(out)
+        out = self.act(out)
+        out = self.proj_out(out)
+        return self.act(out + identity)
+
+
 def _create_fusion_block(block_type, c1, c2, num_blocks, expansion, act):
     """Create a fusion block by type. Falls back to CSPRepLayer."""
     if block_type == 'fcm':
@@ -24,6 +67,8 @@ def _create_fusion_block(block_type, c1, c2, num_blocks, expansion, act):
     elif block_type == 'freq':
         from ...nn.backbone.fusion_modules import FreqSpatialBlock
         return FreqSpatialBlock(c1, c2, num_blocks=num_blocks)
+    elif block_type == 'ccfm':
+        return CCFMBlock(c1, c2)
     else:
         return CSPRepLayer(c1, c2, num_blocks=num_blocks, expansion=expansion, act=act)
 
@@ -275,7 +320,8 @@ class HybridEncoder(nn.Module):
                  attn_type=None,
                  spatial_bias=False,
                  isfe_enabled=False,
-                 cscg_enabled=False):
+                 cscg_enabled=False,
+                 encoder_type='standard'):
         super().__init__()
         self.in_channels = in_channels
         self.feat_strides = feat_strides
@@ -305,16 +351,27 @@ class HybridEncoder(nn.Module):
             self.input_proj.append(proj)
 
         # encoder transformer
-        encoder_layer = TransformerEncoderLayer(
-            hidden_dim, 
-            nhead=nhead,
-            dim_feedforward=dim_feedforward, 
-            dropout=dropout,
-            activation=enc_act)
+        self.encoder_type = encoder_type
+        if encoder_type == 'enhanced':
+            from ...nn.backbone.encoder_enhanced import EnhancedEncoderLayer
+            encoder_layer = EnhancedEncoderLayer(
+                d_model=hidden_dim,
+                nhead=nhead)
+            self.encoder = nn.ModuleList([
+                nn.ModuleList([copy.deepcopy(encoder_layer) for _ in range(num_encoder_layers)])
+                for _ in range(len(use_encoder_idx))
+            ])
+        else:
+            encoder_layer = TransformerEncoderLayer(
+                hidden_dim,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                activation=enc_act)
 
-        self.encoder = nn.ModuleList([
-            TransformerEncoder(copy.deepcopy(encoder_layer), num_encoder_layers) for _ in range(len(use_encoder_idx))
-        ])
+            self.encoder = nn.ModuleList([
+                TransformerEncoder(copy.deepcopy(encoder_layer), num_encoder_layers) for _ in range(len(use_encoder_idx))
+            ])
 
         # top-down fpn
         self.lateral_convs = nn.ModuleList()
@@ -417,17 +474,24 @@ class HybridEncoder(nn.Module):
         # encoder
         if self.num_encoder_layers > 0:
             for i, enc_ind in enumerate(self.use_encoder_idx):
-                h, w = proj_feats[enc_ind].shape[2:]
-                # flatten [B, C, H, W] to [B, HxW, C]
-                src_flatten = proj_feats[enc_ind].flatten(2).permute(0, 2, 1)
-                if self.training or self.eval_spatial_size is None:
-                    pos_embed = self.build_2d_sincos_position_embedding(
-                        w, h, self.hidden_dim, self.pe_temperature).to(src_flatten.device)
+                if self.encoder_type == 'enhanced':
+                    # Enhanced: pass [B, C, H, W] directly, layer handles internal format
+                    feat = proj_feats[enc_ind]
+                    for layer in self.encoder[i]:
+                        feat = layer(feat)
+                    proj_feats[enc_ind] = feat
                 else:
-                    pos_embed = getattr(self, f'pos_embed{enc_ind}', None).to(src_flatten.device)
+                    h, w = proj_feats[enc_ind].shape[2:]
+                    # flatten [B, C, H, W] to [B, HxW, C]
+                    src_flatten = proj_feats[enc_ind].flatten(2).permute(0, 2, 1)
+                    if self.training or self.eval_spatial_size is None:
+                        pos_embed = self.build_2d_sincos_position_embedding(
+                            w, h, self.hidden_dim, self.pe_temperature).to(src_flatten.device)
+                    else:
+                        pos_embed = getattr(self, f'pos_embed{enc_ind}', None).to(src_flatten.device)
 
-                memory :torch.Tensor = self.encoder[i](src_flatten, pos_embed=pos_embed)
-                proj_feats[enc_ind] = memory.permute(0, 2, 1).reshape(-1, self.hidden_dim, h, w).contiguous()
+                    memory :torch.Tensor = self.encoder[i](src_flatten, pos_embed=pos_embed)
+                    proj_feats[enc_ind] = memory.permute(0, 2, 1).reshape(-1, self.hidden_dim, h, w).contiguous()
 
         # plug-and-play: attention after projection
         proj_feats = [self.input_attns[i](f) for i, f in enumerate(proj_feats)]

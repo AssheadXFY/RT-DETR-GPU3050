@@ -37,13 +37,14 @@ class MLP(nn.Module):
 
 class MSDeformableAttention(nn.Module):
     def __init__(
-        self, 
-        embed_dim=256, 
-        num_heads=8, 
-        num_levels=4, 
-        num_points=4, 
+        self,
+        embed_dim=256,
+        num_heads=8,
+        num_levels=4,
+        num_points=4,
         method='default',
         offset_scale=0.5,
+        use_level_weight=False,
     ):
         """Multi-Scale Deformable Attention
         """
@@ -60,7 +61,7 @@ class MSDeformableAttention(nn.Module):
             num_points_list = [num_points for _ in range(num_levels)]
 
         self.num_points_list = num_points_list
-        
+
         num_points_scale = [1/n for n in num_points_list for _ in range(n)]
         self.register_buffer('num_points_scale', torch.tensor(num_points_scale, dtype=torch.float32))
 
@@ -75,7 +76,16 @@ class MSDeformableAttention(nn.Module):
         self.value_proj = nn.Linear(embed_dim, embed_dim)
         self.output_proj = nn.Linear(embed_dim, embed_dim)
 
-        self.ms_deformable_attn_core = functools.partial(deformable_attention_core_func_v2, method=self.method) 
+        self.ms_deformable_attn_core = functools.partial(deformable_attention_core_func_v2, method=self.method)
+
+        # Scale-Aware Cross-Attention: query-conditioned per-level sampling bias
+        self.use_level_weight = use_level_weight
+        if use_level_weight:
+            self.level_predictor = nn.Sequential(
+                nn.Linear(embed_dim + 2, embed_dim // 4),
+                nn.ReLU(inplace=True),
+                nn.Linear(embed_dim // 4, num_levels),
+            )
 
         self._reset_parameters()
 
@@ -136,7 +146,19 @@ class MSDeformableAttention(nn.Module):
         sampling_offsets = sampling_offsets.reshape(bs, Len_q, self.num_heads, sum(self.num_points_list), 2)
 
         attention_weights = self.attention_weights(query).reshape(bs, Len_q, self.num_heads, sum(self.num_points_list))
-        attention_weights = F.softmax(attention_weights, dim=-1).reshape(bs, Len_q, self.num_heads, sum(self.num_points_list))
+        attention_weights = F.softmax(attention_weights, dim=-1)
+        # Scale-Aware Level Weight: per-query modulation of level importance
+        if self.use_level_weight:
+            ref_w = reference_points[:, :, 0, 2:3] if reference_points.shape[-1] >= 4 else reference_points[:, :, 0, :1]
+            ref_h = reference_points[:, :, 0, 3:4] if reference_points.shape[-1] >= 4 else reference_points[:, :, 0, 1:2]
+            lvl_in = torch.cat([query, ref_w.expand(-1, -1, 1), ref_h.expand(-1, -1, 1)], dim=-1)
+            lvl_w = F.softmax(self.level_predictor(lvl_in), dim=-1)  # [bs, Len_q, num_levels]
+            # expand per-point
+            lvl_w_pts = torch.cat(
+                [lvl_w[:, :, l:l+1].repeat(1, 1, n) for l, n in enumerate(self.num_points_list)], dim=-1)
+            attention_weights = attention_weights * lvl_w_pts.unsqueeze(2)
+            attention_weights = attention_weights / attention_weights.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        attention_weights = attention_weights.reshape(bs, Len_q, self.num_heads, sum(self.num_points_list))
 
         if reference_points.shape[-1] == 2:
             offset_normalizer = torch.tensor(value_spatial_shapes)
@@ -169,7 +191,8 @@ class TransformerDecoderLayer(nn.Module):
                  activation='relu',
                  n_levels=4,
                  n_points=4,
-                 cross_attn_method='default'):
+                 cross_attn_method='default',
+                 use_cross_level_weight=False):
         super(TransformerDecoderLayer, self).__init__()
 
         # self attention
@@ -178,7 +201,9 @@ class TransformerDecoderLayer(nn.Module):
         self.norm1 = nn.LayerNorm(d_model)
 
         # cross attention
-        self.cross_attn = MSDeformableAttention(d_model, n_head, n_levels, n_points, method=cross_attn_method)
+        self.cross_attn = MSDeformableAttention(d_model, n_head, n_levels, n_points,
+                                                 method=cross_attn_method,
+                                                 use_level_weight=use_cross_level_weight)
         self.dropout2 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(d_model)
 
@@ -315,7 +340,9 @@ class RTDETRTransformerv2(nn.Module):
                  num_query_groups=1,
                  query_group_noise=0.1,
                  query_group_noise_type='gaussian',
-                 encoder_beacon=0.0):
+                 query_group_spatial_noise=0.02,
+                 encoder_beacon=0.0,
+                 use_cross_level_weight=False):
         super().__init__()
         assert len(feat_channels) <= num_levels
         assert len(feat_strides) == len(feat_channels)
@@ -344,7 +371,8 @@ class RTDETRTransformerv2(nn.Module):
 
         # Transformer module
         decoder_layer = TransformerDecoderLayer(hidden_dim, nhead, dim_feedforward, dropout, \
-            activation, num_levels, num_points, cross_attn_method=cross_attn_method)
+            activation, num_levels, num_points, cross_attn_method=cross_attn_method,
+            use_cross_level_weight=use_cross_level_weight)
         self.decoder = TransformerDecoder(hidden_dim, decoder_layer, num_layers, eval_idx)
 
         # denoising
@@ -356,6 +384,7 @@ class RTDETRTransformerv2(nn.Module):
         self.num_query_groups = num_query_groups
         self.query_group_noise = query_group_noise
         self.query_group_noise_type = query_group_noise_type
+        self.query_group_spatial_noise = query_group_spatial_noise
         self.encoder_beacon = encoder_beacon
         if num_denoising > 0: 
             self.denoising_class_embed = nn.Embedding(num_classes+1, hidden_dim, padding_idx=num_classes)
@@ -647,7 +676,13 @@ class RTDETRTransformerv2(nn.Module):
                 # Gaussian: unstructured isotropic noise
                 noise = torch.randn(bs, nq * K, d, device=reg_content.device) * self.query_group_noise
                 content_multi = content_multi + noise
+            # per-group spatial perturbation on reference points
             bbox_multi = reg_bbox.repeat(1, K, 1)
+            if self.query_group_spatial_noise > 0:
+                spatial_noise = torch.randn_like(bbox_multi) * self.query_group_spatial_noise
+                # dampen size perturbation relative to center
+                spatial_noise[..., 2:] *= 0.5
+                bbox_multi = bbox_multi + spatial_noise
 
             if dn_meta is not None:
                 init_ref_contents = torch.cat([dn_content, content_multi], dim=1)
