@@ -200,6 +200,40 @@ S1: 空闲 (原 container-778a4ea2cd-343930bd, 可能已变更)
 我们当前的迁移:
   encoder_enhanced.py: 自包含的 ASSA_SEFN_Mona_DyT 组合层
   hybrid_encoder.py: encoder_type='enhanced' 一键切换
-  实验: enhanced-only smoke test 正在 S2 运行
+
+----------------------------------------------------------------------
+9. 2026-07-07 进展：SACA + MALoss + 魔鬼面具深度挖掘
+----------------------------------------------------------------------
+
+=== SACA (Scale-Aware Cross-Attention) ===
+机制: query-conditioned per-level sampling weight (MLP 256+2→64→3)
+SACA-only: epoch 0 = 13.72%
+J+SACA:    epoch 0 = 15.70% (+0.84 vs J-only 14.86%)
+ISFE synergy 模式复现: 单独有害, 组合反超
+待验证: epoch 1-2 确认 delta 是否持续
+
+=== MALoss 代码就绪 (DEIM CVPR 2025) ===
+rtdetrv2_criterion.py: 新增 loss_labels_mal
+与VFL区别: IoU→IoU^γ, weight去掉alpha
+理由: J创建K组匹配质量不均, MALoss压低低质量匹配权重
+Config: mal.yml / mal_j.yml
+
+=== 魔鬼面具训练策略差异 ===
+他们的 default.yaml:
+  amp: False (我们use_amp=True)
+  deterministic: True
+  mosaic: 0
+  batch: 4 (我们16)
+15种Loss可选: MALoss/SlideLoss/WiseIoU/NWD/GCD等
+
+=== 论文方向 ===
+A: J + SACA (decoder dual-level diversification)
+B: J + MALoss (number × quality supervision)
+C: J + SACA + MALoss
+
+=== 实验室 ===
+容器: 406cce8a63b5, /workspace/XieFeiyang
+torch 2.5.1+cu121, venv就绪
+问题: 缺 --gpus device=3
 
 ======================================================================
