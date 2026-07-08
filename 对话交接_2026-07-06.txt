@@ -234,6 +234,48 @@ C: J + SACA + MALoss
 === 实验室 ===
 容器: 406cce8a63b5, /workspace/XieFeiyang
 torch 2.5.1+cu121, venv就绪
-问题: 缺 --gpus device=3
+问题: 缺 --gpus device=3（已修复，shm 32G + GPU 已通）
+
+----------------------------------------------------------------------
+10. 2026-07-08 进展：实验室就绪 + 最终方案确认
+----------------------------------------------------------------------
+
+=== 实验室服务器就绪 ===
+容器: 2a29bd3ad754, /workspace/XieFeiyang/
+GPU: NVIDIA TITAN Xp 12G
+PyTorch 2.5.1+cu121, venv 正常
+shm: 32G (管理员已加 --shm-size=32g)
+数据集: COCO 2017 完整 (软链自旧目录)
+预训练权重: 本地路径, 不触发 torch.hub 下载
+dataloader: num_workers=4, 预留配置 0
+
+=== 分工业态 ===
+实验室 Titan Xp — 长跑 (baseline 120e, J+SACA 120e)
+新 S2 (d7834d8003) RTX 3090 — smoke test (SACA-only消融, 新方案验证)
+旧 S2 (a574409304) RTX 3090 — 备用 smoke test
+
+=== 最终实验矩阵 (closed) ===
+| Config | Epoch 0 | Epoch 1 | Epoch 2 | 判决 |
+|--------|---------|---------|---------|------|
+| Baseline* | ~13.9% | — | — | 实验室跑中 |
+| J-only | 14.86% | 24.20% | 27.57% | 有效 |
+| SACA-only | 13.72% | — | — | 单独有害 |
+| J+SACA | 15.70% | 24.55% | 28.02% | **唯一赢家** |
+| MAL-only | 12.24% | — | — | 死 |
+| J+MAL | 13.81% | — | — | 死 |
+*seed=42隐含基线
+
+J+SACA 的 delta: +0.84/+0.35/+0.45 vs J-only
+三个 epoch 连续正, 且 epoch 2 反弹 (+0.45 > +0.35)
+
+=== 论文 ===
+最终方案: J (decoder query diversification) + SACA (scale-aware cross-attention)
+组件来源: J = RT-DETRv3 WACV2025, SACA = 原创
+投稿叙事: 双端协同 — decoder侧监督密度 + encoder侧信息摄入多样性
+
+=== 待补实验 ===
+[ ] 实验室 baseline seed=42 120 epoch (已跑 ep0)
+[ ] SACA-only epoch 1-2 消融 (S2)
+[ ] J+SACA 120 epoch (S2 或实验室)
 
 ======================================================================
