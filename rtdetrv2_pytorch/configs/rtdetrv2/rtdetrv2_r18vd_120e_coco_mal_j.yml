@@ -31,6 +31,10 @@ RTDETRTransformerv2:
 
 RTDETRCriterionv2:
   losses: ['mal', 'boxes']
+  weight_dict:
+    loss_mal: 1
+    loss_bbox: 5
+    loss_giou: 2
 
 
 epoches: 120
