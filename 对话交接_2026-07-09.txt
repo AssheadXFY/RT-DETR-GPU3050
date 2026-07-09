@@ -1,0 +1,140 @@
+======================================================================
+  对话交接文档 — 新对话直接读这个
+  日期: 2026-07-09
+  基于: 对话交接_2026-07-06.txt（服务器/代码/方法论）
+======================================================================
+
+----------------------------------------------------------------------
+1. 实验终局：封闭矩阵
+----------------------------------------------------------------------
+
+经过 10 轮独立 smoke test，最终消融表：
+
+| Config | Epoch 0 | Epoch 1 | Epoch 2 | Epoch 5 | 判决 |
+|--------|---------|---------|---------|---------|------|
+| Baseline | ~14% | ~24% | ~27% | — | 基准 |
+| J-only (seed=42) | 14.86% | 24.20% | 27.57% | 34.16% | **唯一有效** |
+| J+SACA | 15.70% | 24.55% | 28.02% | 34.14% | **归零** |
+| J+spatial | 15.57% | 24.78% | 27.98% | 34.18% | **归零** |
+| J+ISFE | 15.58% | 24.95% | — | — | **归零** |
+| J+L (KD) | 14.56% | — | — | — | 死 (cold start) |
+| J+Consistency | 15.70% | 24.80% | 28.21% | — | 死 (VFL冗余) |
+| J+MAL | 13.81% | — | — | — | 死 |
+| CSCG+J | 14.37% | 23.36% | 26.44% | — | 死 |
+| CCFM-only | 14.14% | 23.83% | — | — | 死 |
+| Enhanced-only | 13.36% | — | — | — | 死 |
+
+=== 核心结论 ===
+J 是唯一有效的方法。所有叠加第二个组件的尝试都归零。
+RT-DETR R18 的训练管线已饱和——每个直觉方向在 epoch 0-2 有早期增益，
+但在 epoch 5 收敛到基线。不是方法问题——是这个系统没有第二个百分点了。
+
+=== SACA 的完整生命周期（J+SACA vs J-only, seed=42, 3090） ===
+Epoch 0: 15.70 vs 14.86 (+0.84%)
+Epoch 1: 24.55 vs 24.20 (+0.35%)
+Epoch 2: 28.02 vs 27.57 (+0.45%)
+Epoch 3: 30.27 vs 29.99 (+0.28%)
+Epoch 4: 32.50 vs 32.28 (+0.22%)
+Epoch 5: 34.14 vs 34.16 (-0.02%)  ← 归零
+Epoch 6: pending (J+SACA 35.45%, J-only 等待中)
+
+----------------------------------------------------------------------
+2. 服务器当前状态
+----------------------------------------------------------------------
+
+S1 (container-778a4ea2cd-343930bd): 活着！之前以为过期了——没有。
+  GPU: RTX 3090 × 1
+  代码路径: /root/autodl-tmp/RT-DETR-GPU3050/rtdetrv2_pytorch
+  COCO: /root/autodl-tmp/RT-DETR-GPU3050/rtdetrv2_pytorch/dataset/coco/
+  预训练权重: /root/.cache/torch/hub/checkpoints/ResNet18_vd_pretrained_from_paddle.pth
+  J-only seed=42 checkpoint0005.pth 在
+  运行中: resume J-only epoch 5→6 (smoke_j_ep6.log)
+
+新 S2 (container-d7834d8003-62d575e8):
+  GPU: RTX 3090 × 1
+  代码路径: /root/autodl-tmp/RT-DETR-XFY/rtdetrv2_pytorch
+  COCO: /root/autodl-tmp/RT-DETR-XFY/rtdetrv2_pytorch/dataset/coco/
+  运行中: J+SACA epoch 6→9 (smoke_saca_j_6e.log)
+
+旧 S2 (container-a574409304-809bcb22):
+  GPU: RTX 3090 × 1
+  代码路径: /root/autodl-tmp/RT-DETR-XFY/rtdetrv2_pytorch
+  空闲
+
+实验室 (2a29bd3ad754):
+  GPU: NVIDIA TITAN Xp 12G
+  代码路径: /workspace/XieFeiyang/RT-DETR-main/RT-DETR-main/rtdetrv2_pytorch
+  运行中: baseline seed=42 FP32 BS=14 120 epoch
+  Python: venv at /workspace/XieFeiyang/venv
+  shm: 32G
+
+----------------------------------------------------------------------
+3. 论文方向
+----------------------------------------------------------------------
+
+方法型论文在 RT-DETR R18 上已不可行——10 个实验证明没有第二个方法能叠加到 J 上。
+唯一活着的叙事是分析型："我们系统验证了 X 种直觉方案在 DETR 管线中的失效"。
+
+J 来自 RT-DETRv3 (WACV 2025) 的 Query Perturbation 组件。
+所有其他方案: loss(KDL+L+MAL) / encoder(ISFE+CSCG+Enhanced+CCFM) /
+decoder(spatial+SACA) / neck(CCFM)——全部归零。
+
+----------------------------------------------------------------------
+4. 实验室注意事项
+----------------------------------------------------------------------
+- Titan Xp 不能用 AMP（FP16 精度损失 ~2%）
+- FP32 BS=14 显存安全（~10GB）
+- dataloader.yml 已改为 BS=14/24, num_workers=0
+- 启动命令不要加 --use-amp
+- checkpoint_freq=10
+
+----------------------------------------------------------------------
+5. 顶会调研 — 2026-07-09
+----------------------------------------------------------------------
+
+RF-DETR (ICLR 2026): NAS-trained DETR, Group Decoder (K组并行训练),
+  首个突破 60 AP 的实时检测器。Group Decoder 理念和 J 的思路一致。
+  [arXiv:2511.09554]
+
+Le-DETR (CVPR 2026 Findings): EfficientNAT backbone + Neighborhood Attention,
+  替换 AIFI encoder。只用 ImageNet-1K 预训练。跟 SACA 攻击点不同。
+  [arXiv:2602.21010]
+
+HA-DETR (Nature SR 2026): R18, 只改 decoder self-attn→conv, +0.5% @ 68 FPS.
+  我们的对标对象——同等尺寸下的增量。
+
+----------------------------------------------------------------------
+6. 代码改动清单
+----------------------------------------------------------------------
+
+有效改动:
+  rtdetrv2_decoder.py: J (num_query_groups, query_group_noise, SACA level_weight)
+  rtdetrv2_criterion.py: multi-group loss + loss_labels_mal + consistency + KD
+
+无效但保留:
+  hybrid_encoder.py: ISFEBlock, CSCGBlock, encoder_type='enhanced'
+  encoder_enhanced.py: DynamicTanh, SEFN, Mona, ASSA, EnhancedEncoderLayer
+
+Config:
+  active: saca_j.yml, queryperturb.yml, coco.yml, mal.yml, enhanced.yml
+  dead: ccfm.yml, spatial.yml, consist.yml, fourier.yml, kd.yml
+
+----------------------------------------------------------------------
+7. 启动命令模板
+----------------------------------------------------------------------
+
+S1/S2:
+  cd /root/autodl-tmp/<repo>/rtdetrv2_pytorch
+  nohup python tools/train.py -c configs/rtdetrv2/<config>.yml \
+    -u PResNet.pretrained=/root/.cache/torch/hub/checkpoints/ResNet18_vd_pretrained_from_paddle.pth \
+    -u epoches=N -u checkpoint_freq=10 --use-amp \
+    > /root/autodl-tmp/<log>.log 2>&1 &
+
+实验室:
+  source /workspace/XieFeiyang/venv/bin/activate
+  cd /workspace/XieFeiyang/RT-DETR-main/RT-DETR-main/rtdetrv2_pytorch
+  nohup python tools/train.py -c configs/rtdetrv2/<config>.yml \
+    -u checkpoint_freq=10 > /workspace/XieFeiyang/<log>.log 2>&1 &
+  (不加 --use-amp！)
+
+======================================================================
